@@ -4,6 +4,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import JSZip from 'jszip'
+import ExcelJS from 'exceljs'
 import { documentFormat, extractDocumentText, isDocumentSendRequest, prepareDocumentTarget,
   readOutboundDocument, requestedDocumentFormats } from './document-media.ts'
 
@@ -47,6 +48,17 @@ function samplePdf(): Buffer {
   return Buffer.from(output)
 }
 
+async function sampleXlsx(): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook()
+  const sheet = workbook.addWorksheet('Data')
+  sheet.getCell('A1').value = 'Nama'
+  sheet.getCell('B1').value = 'Nilai'
+  sheet.getCell('A2').value = 'Tan'
+  sheet.getCell('B2').value = 42
+  sheet.getCell('C2').value = { formula: 'B2*2', result: 84 }
+  return Buffer.from(await workbook.xlsx.writeBuffer())
+}
+
 test('document intent and format require an explicit send request', () => {
   assert.equal(documentFormat('report.docx', 'application/octet-stream'), 'docx')
   assert.equal(documentFormat('report.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'), 'xlsx')
@@ -54,6 +66,8 @@ test('document intent and format require an explicit send request', () => {
   assert.equal(documentFormat('report.pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'), undefined)
   assert.equal(isDocumentSendRequest('edit lalu kirim balik', true), true)
   assert.equal(isDocumentSendRequest('kirimkan file excel'), true)
+  assert.equal(isDocumentSendRequest('buatkan xlsx laporan penjualan yang rapi'), true)
+  assert.equal(isDocumentSendRequest('bagaimana cara buat xlsx?'), false)
   assert.equal(isDocumentSendRequest('tolong baca dokumen ini', true), false)
   assert.equal(isDocumentSendRequest('jangan kirim dokumen ini', true), false)
   assert.deepEqual(requestedDocumentFormats('kirim versi docx dan pdf'), ['docx', 'pdf'])
@@ -61,7 +75,7 @@ test('document intent and format require an explicit send request', () => {
   assert.deepEqual(requestedDocumentFormats('edit lalu kirim balik', 'pdf'), ['pdf'])
 })
 
-test('DOCX and PDF text is extracted and scoped outbound files are verified', async () => {
+test('DOCX, PDF, and XLSX contents are extracted and scoped outbound files are verified', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'elara-document-test-'))
   try {
     const sender = 'a'.repeat(24)
@@ -69,6 +83,7 @@ test('DOCX and PDF text is extracted and scoped outbound files are verified', as
     for (const [format, bytes, marker] of [
       ['docx', await sampleDocx(), 'Isi DOCX sintetis'],
       ['pdf', samplePdf(), 'Isi PDF sintetis'],
+      ['xlsx', await sampleXlsx(), 'B2: 42'],
     ] as const) {
       assert.match(await extractDocumentText(bytes, format), new RegExp(marker))
       const target = prepareDocumentTarget(root, sender, operation, format)
@@ -77,14 +92,24 @@ test('DOCX and PDF text is extracted and scoped outbound files are verified', as
       assert.ok(result.bytes.equals(bytes))
       assert.equal(result.fileName, `dokumen-elara.${format}`)
       assert.equal(result.mime, format === 'pdf' ? 'application/pdf'
-        : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        : format === 'docx' ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+          : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
       assert.throws(() => prepareDocumentTarget(root, sender, operation, format), /DOCUMENT_TARGET_EXISTS/)
     }
+    assert.match(await extractDocumentText(await sampleXlsx(), 'xlsx'), /C2: =B2\*2 \[hasil tersimpan: 84\]/u)
+    const large = new ExcelJS.Workbook()
+    large.addWorksheet('Batas').getCell('A201').value = 'Tidak boleh diklaim terbaca'
+    const preview = await extractDocumentText(Buffer.from(await large.xlsx.writeBuffer()), 'xlsx')
+    assert.match(preview, /Cuplikan spreadsheet terpotong/u)
+    assert.doesNotMatch(preview, /Tidak boleh diklaim terbaca/u)
     const outside = path.join(root, 'outside.pdf')
     fs.writeFileSync(outside, samplePdf())
     await assert.rejects(() => readOutboundDocument(outside, root, 'pdf'), /DOCUMENT_TARGET_INVALID/)
     const invalid = prepareDocumentTarget(root, sender, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'pdf')
     fs.writeFileSync(invalid, 'not a PDF')
     await assert.rejects(() => readOutboundDocument(invalid, root, 'pdf'), /DOCUMENT_INVALID/)
+    const badXlsx = prepareDocumentTarget(root, sender, 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'xlsx')
+    fs.writeFileSync(badXlsx, Buffer.from('PK\x03\x04not-an-xlsx'))
+    await assert.rejects(() => readOutboundDocument(badXlsx, root, 'xlsx'), /DOCUMENT_READ_FAILED/)
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })

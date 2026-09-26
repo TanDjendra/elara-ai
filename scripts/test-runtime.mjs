@@ -26,6 +26,8 @@ const managedEnvironment = [
   'ELARA_MODE',
   'ELARA_MOCK_WA', 'ELARA_DASHBOARD_PORT', 'ELARA_DASHBOARD_TOKEN',
   'ELARA_RUNTIME_REQUEST_LOG', 'ELARA_RUNTIME_DISPOSE_MARKER',
+  'ELARA_RUNTIME_DOCUMENT_FIXTURE_DOCX', 'ELARA_RUNTIME_DOCUMENT_FIXTURE_PDF',
+  'ELARA_RUNTIME_DOCUMENT_FIXTURE_XLSX',
   'ELARA_TRANSCRIPTION_BASE_URL',
 ]
 const previousEnvironment = Object.fromEntries(managedEnvironment.map(name => [name, process.env[name]]))
@@ -122,6 +124,41 @@ function requestRows() {
   return fs.readFileSync(requestLog, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
 }
 
+async function documentFixtureBytes() {
+  const channelRequire = createRequire(path.join(repositoryRoot, 'channels', 'whatsapp-baileys', 'package.json'))
+  const JSZip = channelRequire('jszip')
+  const zip = new JSZip()
+  zip.file('[Content_Types].xml', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+  zip.file('_rels/.rels', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+  zip.file('word/document.xml', '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Isi DOCX sintetis runtime</w:t></w:r></w:p></w:body></w:document>')
+  const docx = await zip.generateAsync({ type: 'nodebuffer' })
+  const ExcelJS = channelRequire('exceljs')
+  const workbook = new ExcelJS.Workbook()
+  const sheet = workbook.addWorksheet('Data')
+  sheet.getCell('A1').value = 'Isi XLSX sintetis runtime'
+  sheet.getCell('B1').value = 42
+  sheet.getCell('C1').value = { formula: 'B1*2', result: 84 }
+  const xlsx = Buffer.from(await workbook.xlsx.writeBuffer())
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    '<< /Length 55 >>\nstream\nBT /F1 12 Tf 50 750 Td (Isi PDF sintetis runtime) Tj ET\nendstream',
+  ]
+  let pdf = '%PDF-1.4\n'
+  const offsets = [0]
+  for (const [index, object] of objects.entries()) {
+    offsets.push(Buffer.byteLength(pdf))
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`
+  }
+  const start = Buffer.byteLength(pdf)
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  for (const offset of offsets.slice(1)) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`
+  pdf += `trailer\n<< /Root 1 0 R /Size ${objects.length + 1} >>\nstartxref\n${start}\n%%EOF\n`
+  return { docx, pdf: Buffer.from(pdf), xlsx }
+}
+
 async function createLocalAgent(sessionId, cwd = fixtureRoot) {
   ctx.access.bindRootSession(sessionId, 'fixture-operator', 'dashboard')
   const selection = ctx.agentDefaultModel.currentSelection()
@@ -138,6 +175,13 @@ before(async () => {
   dashboardPort = await freePort()
   dashboardUrl = `http://127.0.0.1:${dashboardPort}`
   fs.mkdirSync(dshHome, { recursive: true })
+  const documentFixtures = await documentFixtureBytes()
+  const docxFixturePath = path.join(fixtureRoot, 'fixture-document.docx')
+  const pdfFixturePath = path.join(fixtureRoot, 'fixture-document.pdf')
+  const xlsxFixturePath = path.join(fixtureRoot, 'fixture-document.xlsx')
+  fs.writeFileSync(docxFixturePath, documentFixtures.docx)
+  fs.writeFileSync(pdfFixturePath, documentFixtures.pdf)
+  fs.writeFileSync(xlsxFixturePath, documentFixtures.xlsx)
   fs.writeFileSync(path.join(dshHome, 'settings.yaml'), '{}\n')
   const accessConfigPath = path.join(fixtureRoot, 'access.json')
   fs.writeFileSync(accessConfigPath, JSON.stringify({
@@ -189,6 +233,9 @@ before(async () => {
     ELARA_DASHBOARD_TOKEN: dashboardToken,
     ELARA_RUNTIME_REQUEST_LOG: requestLog,
     ELARA_RUNTIME_DISPOSE_MARKER: disposeMarker,
+    ELARA_RUNTIME_DOCUMENT_FIXTURE_DOCX: docxFixturePath,
+    ELARA_RUNTIME_DOCUMENT_FIXTURE_PDF: pdfFixturePath,
+    ELARA_RUNTIME_DOCUMENT_FIXTURE_XLSX: xlsxFixturePath,
   })
 
   const dshRequire = createRequire(path.join(dshRoot, 'apps', 'cli', 'package.json'))
@@ -218,6 +265,9 @@ before(async () => {
     'channels/whatsapp-baileys/approval-buttons.ts',
     'channels/whatsapp-baileys/autonomy.ts',
     'channels/whatsapp-baileys/outbound-screenshot.ts',
+    'channels/whatsapp-baileys/document-media.ts',
+    'channels/whatsapp-baileys/ocr-local.ts',
+    'channels/whatsapp-baileys/link-download.ts',
     'channels/whatsapp-baileys/format.ts', 'channels/whatsapp-baileys/message-context.ts',
     'channels/whatsapp-baileys/transcription.ts', 'channels/whatsapp-baileys/typing.ts',
     'tests/fixtures/runtime/fake-provider.ts',
@@ -1301,6 +1351,198 @@ describe('offline DSH-loader composition', () => {
     assert.equal(sent.slice(missingStart).some(item => item.remoteJid === jid && item.image), false)
   })
 
+  test('DOCX, PDF, and XLSX attachments are read, and owner-requested documents are sent from scoped outputs', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    for (const format of ['docx', 'pdf', 'xlsx']) {
+      const fixture = fs.readFileSync(process.env[`ELARA_RUNTIME_DOCUMENT_FIXTURE_${format.toUpperCase()}`])
+      const text = `fixture baca dokumen ${format}`
+      emitStructuredMessage(jid, `fixture-inbound-${format}`, { documentMessage: {
+        caption: text, fileName: `contoh.${format}`,
+        mimetype: format === 'pdf' ? 'application/pdf'
+          : format === 'docx' ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        __fixtureBytes: [...fixture],
+      } })
+      await waitFor(() => requestRows().find(row => row.text.startsWith(text)
+        && row.text.includes(`Isi ${format.toUpperCase()} sintetis runtime`)), `inbound ${format} extraction`)
+
+      const before = sent.length
+      emitMessage(jid, `fixture-outbound-${format}`, `fixture kirim dokumen ${format}`)
+      const output = await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && Buffer.isBuffer(item.document)), `outbound ${format} document`, 4_000).catch(error => {
+          const replies = sent.slice(before).filter(item => item.remoteJid === jid)
+            .map(item => item.text || (item.document ? 'document' : 'other'))
+          throw new Error(`${error.message}; fixture replies: ${JSON.stringify(replies)}`)
+        })
+      assert.equal(output.fileName, `dokumen-elara.${format}`)
+      assert.ok(output.document.equals(fixture))
+      assert.equal(output.mimetype, format === 'pdf' ? 'application/pdf'
+        : format === 'docx' ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+          : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+      assert.equal(sent.slice(before).some(item => item.remoteJid === jid
+        && item.text?.includes(`fixture:fixture kirim dokumen ${format}`)), false)
+    }
+
+    const createBefore = sent.length
+    emitMessage(jid, 'fixture-create-xlsx', 'fixture buatkan xlsx laporan')
+    const created = await waitFor(() => sent.slice(createBefore).find(item => item.remoteJid === jid
+      && Buffer.isBuffer(item.document)), 'XLSX creation intent')
+    assert.equal(created.fileName, 'dokumen-elara.xlsx')
+    assert.equal(created.mimetype, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+    const missingStart = sent.length
+    emitMessage(jid, 'fixture-document-missing', 'kirim dokumen docx yang belum ada')
+    await waitFor(() => sent.slice(missingStart).find(item => item.remoteJid === jid
+      && item.text?.includes('belum berhasil')), 'missing document response')
+    assert.equal(sent.slice(missingStart).some(item => item.remoteJid === jid && item.document), false)
+
+    const otherStart = sent.length
+    emitMessage('user-a@s.whatsapp.net', 'fixture-document-nonowner', 'kirim dokumen pdf')
+    await waitFor(() => sent.slice(otherStart).find(item => item.remoteJid === 'user-a@s.whatsapp.net'
+      && item.text?.includes('hanya tersedia untuk nomor owner')), 'non-owner document rejection')
+    assert.equal(sent.slice(otherStart).some(item => item.remoteJid === 'user-a@s.whatsapp.net'
+      && item.document), false)
+  })
+
+  test('stop fences a document before it can be sent', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const block = blockFixtureResponse('fixture kirim dokumen docx')
+    const before = sent.length
+    try {
+      emitMessage(jid, 'fixture-document-stopped', 'fixture kirim dokumen docx')
+      await block.started
+      emitMessage(jid, 'fixture-document-stop-command', '.stop')
+      const ack = await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('Stop diminta')), 'document stop acknowledgment')
+      const stopId = ack.text.match(/ID: ([a-f0-9-]+)/u)?.[1]
+      assert.ok(stopId)
+      await waitFor(() => ctx.control.getStopStatus({ principalId: 'fixture-user-c', originChannel: 'whatsapp' },
+        stopId).outcome !== 'stopping', 'document stop settlement')
+      block.release()
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(sent.slice(before).some(item => item.remoteJid === jid && item.document), false)
+    } finally { block.release() }
+  })
+
+  test('photo OCR reaches the model as untrusted text and stop fences a pending OCR result', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAfElEQVR4nNXOQREAIADDsFL/nocIHlyjIGcbZRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncf4OvLpyqgN9ZSiDcwAAAABJRU5ErkJggg==', 'base64')
+    const release = deferred()
+    try {
+      ctx.emit('elara/test-whatsapp-ocr-handler', async () => ({ text: 'RAPAT JAM 8' }))
+      emitStructuredMessage(jid, 'fixture-photo-ocr', { imageMessage: {
+        caption: 'tolong baca tulisan di foto', mimetype: 'image/png', __fixtureBytes: [...png],
+      } })
+      await waitFor(() => requestRows().find(row => row.text.includes('Teks OCR foto')
+        && row.text.includes('RAPAT JAM 8') && row.text.includes('bukan instruksi')), 'photo OCR model context')
+
+      const started = deferred()
+      ctx.emit('elara/test-whatsapp-ocr-handler', async (_root, _bytes, _kind, signal) => {
+        started.resolve()
+        await release.promise
+        if (signal?.aborted) throw new Error('SESSION_STOPPED')
+        return { text: 'OCR TERLAMBAT' }
+      })
+      const before = requestRows().length
+      const sentBefore = sent.length
+      emitStructuredMessage(jid, 'fixture-photo-ocr-pending', { imageMessage: {
+        caption: 'baca teks lagi', mimetype: 'image/png', __fixtureBytes: [...png],
+      } })
+      await started.promise
+      emitMessage(jid, 'fixture-photo-ocr-stop', '.stop')
+      const ack = await waitFor(() => sent.slice(sentBefore).find(item => item.remoteJid === jid
+        && item.text?.includes('Stop diminta')), 'OCR stop acknowledgment')
+      const stopId = ack.text.match(/ID: ([a-f0-9-]+)/u)?.[1]
+      assert.ok(stopId)
+      assert.equal(ctx.control.getStopStatus({ principalId: 'fixture-user-c', originChannel: 'whatsapp' }, stopId).outcome,
+        'stopping')
+      release.resolve()
+      await waitFor(() => ctx.control.getStopStatus({ principalId: 'fixture-user-c', originChannel: 'whatsapp' },
+        stopId).outcome === 'stopped', 'OCR stop settlement')
+      assert.equal(requestRows().slice(before).some(row => row.text.includes('OCR TERLAMBAT')), false)
+      assert.equal(sent.slice(sentBefore).some(item => item.remoteJid === jid && item.text?.includes('fixture:baca teks lagi')), false)
+    } finally {
+      release.resolve()
+      ctx.emit('elara/test-whatsapp-ocr-handler', undefined)
+    }
+  })
+
+  test('owner link download returns a file and stop fences a direct download without a live agent', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const bytes = Buffer.from('%PDF-1.4\nfixture download\n')
+    const release = deferred()
+    try {
+      ctx.emit('elara/test-whatsapp-download-handler', async (_url, _root, _senderKey, _operationId, signal) => {
+        if (signal.aborted) throw new Error('SESSION_STOPPED')
+        return { filePath: path.join(fixtureRoot, '.runtime', 'downloads', 'elara', 'fixture.pdf'),
+          fileName: 'fixture.pdf', mime: 'application/pdf', bytes }
+      })
+      const successBefore = sent.length
+      emitMessage(jid, 'fixture-download-success', 'unduh https://files.example.com/fixture.pdf')
+      const delivered = await waitFor(() => sent.slice(successBefore).find(item => item.remoteJid === jid
+        && Buffer.isBuffer(item.document)), 'downloaded file delivery')
+      assert.ok(delivered.document.equals(bytes))
+      assert.equal(delivered.fileName, 'fixture.pdf')
+      const auditDb = new DatabaseSync(path.join(fixtureRoot, 'control', 'elara-control.db'))
+      try {
+        const rows = auditDb.prepare("SELECT operation_id, execution_id, event_type, reason_code FROM audit_events WHERE reason_code IN ('PUBLIC_FILE_DOWNLOAD', 'DOWNLOAD_COMPLETED') ORDER BY id DESC LIMIT 2").all()
+        assert.equal(rows.length, 2)
+        assert.equal(rows[0].operation_id, rows[1].operation_id)
+        assert.equal(rows[0].execution_id, rows[1].execution_id)
+        assert.equal(JSON.stringify(rows).includes('files.example.com'), false)
+      } finally { auditDb.close() }
+      const otherBefore = sent.length
+      emitMessage('user-a@s.whatsapp.net', 'fixture-download-other', '.download https://files.example.com/fixture.pdf')
+      await waitFor(() => sent.slice(otherBefore).find(item => item.remoteJid === 'user-a@s.whatsapp.net'
+        && item.text?.includes('hanya tersedia untuk nomor owner')), 'nonowner download denial')
+      assert.equal(sent.slice(otherBefore).some(item => item.remoteJid === 'user-a@s.whatsapp.net' && item.document), false)
+
+      const originalAudit = ctx.access.recordAudit
+      let downloadStarted = false
+      ctx.emit('elara/test-whatsapp-download-handler', async () => {
+        downloadStarted = true
+        return { filePath: 'fixture.pdf', fileName: 'fixture.pdf', mime: 'application/pdf', bytes }
+      })
+      const failureBefore = sent.length
+      try {
+        ctx.access.recordAudit = () => { throw new Error('AUDIT_UNAVAILABLE') }
+        emitMessage(jid, 'fixture-download-audit-failure', '.download https://files.example.com/fixture.pdf')
+        await waitFor(() => sent.slice(failureBefore).find(item => item.remoteJid === jid
+          && item.text?.includes('pencatatan audit sedang bermasalah')), 'download audit failure')
+        assert.equal(downloadStarted, false)
+      } finally { ctx.access.recordAudit = originalAudit }
+
+      const freshBefore = sent.length
+      emitMessage(jid, 'fixture-download-new-session', '.new')
+      await waitFor(() => sent.slice(freshBefore).find(item => item.remoteJid === jid
+        && item.text?.includes('konteks baru')), 'fresh download session')
+      const started = deferred()
+      ctx.emit('elara/test-whatsapp-download-handler', async (_url, _root, _senderKey, _operationId, signal) => {
+        started.resolve()
+        await release.promise
+        if (signal.aborted) throw new Error('SESSION_STOPPED')
+        return { filePath: 'fixture.pdf', fileName: 'fixture.pdf', mime: 'application/pdf', bytes }
+      })
+      const stoppedBefore = sent.length
+      emitMessage(jid, 'fixture-download-pending', '.download https://files.example.com/fixture.pdf')
+      await started.promise
+      emitMessage(jid, 'fixture-download-stop', '.stop')
+      const ack = await waitFor(() => sent.slice(stoppedBefore).find(item => item.remoteJid === jid
+        && item.text?.includes('Stop diminta')), 'download stop acknowledgment')
+      const stopId = ack.text.match(/ID: ([a-f0-9-]+)/u)?.[1]
+      assert.ok(stopId)
+      const context = { principalId: 'fixture-user-c', originChannel: 'whatsapp' }
+      assert.equal(ctx.control.getStopStatus(context, stopId).outcome, 'stopping')
+      release.resolve()
+      await waitFor(() => ctx.control.getStopStatus(context, stopId).outcome === 'stopped',
+        'direct download stop settlement')
+      assert.equal(sent.slice(stoppedBefore).some(item => item.remoteJid === jid && item.document), false)
+    } finally {
+      release.resolve()
+      ctx.emit('elara/test-whatsapp-download-handler', undefined)
+    }
+  })
+
   test('only the exact trusted owner alias receives owner identity in the model context', async () => {
     emitMessage('user-c@s.whatsapp.net', 'fixture-owner-identity', 'siapa aku fixture owner')
     const owner = await waitFor(() => requestRows().find(row => row.text === 'siapa aku fixture owner'),
@@ -1396,7 +1638,7 @@ describe('offline DSH-loader composition', () => {
     await waitFor(() => sent.length > beforeSent && sent.at(-1).remoteJid === b
       && sent.at(-1).text?.includes('konteks baru'), 'session reset reply')
     const saved = JSON.parse(fs.readFileSync(path.join(fixtureRoot, '.runtime', 'whatsapp-sessions.json'), 'utf8'))
-    const newSession = Object.values(saved).find(value => typeof value === 'string' && value !== oldSession)
+    const newSession = saved[crypto.createHash('sha256').update(b).digest('hex').slice(0, 24)]
     assert.match(newSession, /^whatsapp:[a-f0-9]{24}:/)
     assert.equal(ctx.access.bindingForSession(newSession)?.principalId, 'fixture-user-b')
     emitMessage(b, 'fixture-session-after-reset', 'pesan setelah reset')
@@ -1569,8 +1811,10 @@ describe('offline DSH-loader composition', () => {
         audioMessage: { ptt: true, mimetype: 'audio/ogg', __fixtureBytes: [79, 103, 103, 83, 4, 5, 6] },
       })
       await enteredPromise
-      ctx.control.requestStop({ principalId: 'fixture-user-a', originChannel: 'whatsapp' }, `whatsapp:${jid}`)
+      const stop = ctx.control.requestStop({ principalId: 'fixture-user-a', originChannel: 'whatsapp' }, `whatsapp:${jid}`)
       releaseResponse()
+      await waitFor(() => ctx.control.getStopStatus({ principalId: 'fixture-user-a', originChannel: 'whatsapp' },
+        stop.id).outcome !== 'stopping', 'voice stop settlement')
       await new Promise(resolve => setImmediate(resolve))
       assert.equal(requestRows().slice(before).some(row => row.text.includes('fixture stopped transcription')), false)
     } finally {

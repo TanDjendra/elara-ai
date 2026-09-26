@@ -256,7 +256,7 @@ export class AutonomyStore {
   }
 
   acknowledgeReminders(principalId: string, senderKey: string): number {
-    return Number(this.db.prepare("UPDATE whatsapp_reminders SET status = 'acknowledged' WHERE principal_id = ? AND sender_key = ? AND status IN ('sending', 'awaiting')")
+    return Number(this.db.prepare("UPDATE whatsapp_reminders SET status = 'acknowledged' WHERE principal_id = ? AND sender_key = ? AND (status = 'awaiting' OR (status = 'sending' AND repeat_count > 0))")
       .run(principalId, senderKey).changes)
   }
 

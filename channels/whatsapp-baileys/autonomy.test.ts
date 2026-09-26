@@ -59,6 +59,7 @@ test('reminders survive restart, stay sender-scoped, and settle once per claim',
     assert.equal(store.setReminderTone('other', 'sender-a', id, 'pasrah lucu'), false)
     assert.equal(store.setReminderTone('owner', 'sender-a', id, 'pasrah lucu'), true)
     assert.equal(store.isReminderSending('owner', 'sender-a', id), true)
+    assert.equal(store.acknowledgeReminders('owner', 'sender-a'), 0)
     store.settleReminder(id, true, now + 1_001, () => 0)
     assert.equal(store.pendingReminders('owner', 'sender-a')[0]?.repeatCount, 1)
     assert.equal(store.pendingReminders('owner', 'sender-a')[0]?.scheduledAt, now + 1_000)
@@ -90,6 +91,23 @@ test('reminder follow-ups stop at the chosen limit without a reply', () => {
     assert.equal(store.nextReminderAt(), undefined)
     assert.equal(store.db.prepare('SELECT status, repeat_count FROM whatsapp_reminders WHERE id = ?')
       .get(id).status, 'sent')
+    store.close()
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('an unsent reminder retries without consuming its message limit', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'elara-reminder-retry-'))
+  try {
+    const store = new AutonomyStore(path.join(root, 'autonomy.db'))
+    const now = 1_800_000_000_000
+    const id = store.addReminder('owner', 'sender', 'source',
+      { dueAt: now + 1_000, text: 'minum air' }, now, () => 0)
+    assert.equal(store.takeDueReminder(now + 1_000)?.id, id)
+    store.settleReminder(id, false, now + 1_000)
+    const row = store.pendingReminders('owner', 'sender')[0]
+    assert.equal(row?.repeatCount, 0)
+    assert.equal(row?.dueAt, now + 61_000)
+    assert.equal(row?.maxSends, 3)
     store.close()
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })

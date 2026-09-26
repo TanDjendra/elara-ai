@@ -83,6 +83,18 @@ class FixtureAdapter {
       fs.mkdirSync(path.dirname(target), { recursive: true })
       fs.writeFileSync(target, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lXcAAAAASUVORK5CYII=', 'base64'))
     }
+    if (text.startsWith('fixture kirim dokumen ') || text.startsWith('fixture buatkan xlsx')) {
+      const instruction = options.messages.flatMap(message => message.content
+        .filter(part => part.type === 'text').map(part => part.text)).reverse()
+        .find(value => value.includes('Adaptor hanya membaca lokasi keluaran'))
+      for (const format of ['DOCX', 'PDF', 'XLSX']) {
+        const target = new RegExp(`${format}: (.+?\\.${format.toLowerCase()})`, 'u').exec(instruction || '')?.[1]
+        if (!target) continue
+        const fixture = process.env[`ELARA_RUNTIME_DOCUMENT_FIXTURE_${format}`]
+        if (!fixture) throw new Error('Synthetic document fixture is missing')
+        fs.writeFileSync(target, fs.readFileSync(fixture))
+      }
+    }
     const logPath = process.env.ELARA_RUNTIME_REQUEST_LOG
     if (logPath) {
       fs.appendFileSync(logPath, `${JSON.stringify({ text, messageCount: options.messages.length,

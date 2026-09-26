@@ -1,12 +1,17 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import mammoth from 'mammoth'
+import ExcelJS from 'exceljs'
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
+import type { OcrOutput } from './ocr-local.ts'
 
 export type DocumentFormat = 'docx' | 'pdf' | 'xlsx'
 const MAX_DOCUMENT_BYTES = 25 * 1024 * 1024
 const MAX_EXTRACTED_CHARS = 30_000
 const MAX_PDF_PAGES = 50
+const MAX_XLSX_SHEETS = 20
+const MAX_XLSX_ROWS = 200
+const MAX_XLSX_COLUMNS = 50
 const MIME: Record<DocumentFormat, string> = {
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   pdf: 'application/pdf',
@@ -28,8 +33,11 @@ export function documentFormat(name: string, mime: string): DocumentFormat | und
 export function isDocumentSendRequest(text: string, hasDocument = false): boolean {
   const normalized = text.trim().toLocaleLowerCase('id-ID')
   if (/^(?:apa|jelaskan|gimana|bagaimana|cara|kenapa|jangan|tidak|nggak)\b/u.test(normalized)) return false
-  return /\b(?:kirim|kirimkan|send|bagikan|share)\b/iu.test(normalized)
+  const explicitSend = /\b(?:kirim|kirimkan|send|bagikan|share)\b/iu.test(normalized)
     && (hasDocument || /\b(?:dokumen|file|berkas|docx|word|pdf|xlsx|excel|spreadsheet|lampiran|whatsapp|wa)\b/iu.test(normalized))
+  const createSpreadsheet = /\b(?:buat|buatkan|bikin|bikinin|siapkan|generate)\b/iu.test(normalized)
+    && /\b(?:xlsx|excel|spreadsheet)\b/iu.test(normalized)
+  return explicitSend || createSpreadsheet
 }
 
 export function requestedDocumentFormats(text: string, incoming?: DocumentFormat): DocumentFormat[] {
@@ -71,8 +79,64 @@ async function checkedBytes(bytes: Buffer, format: DocumentFormat): Promise<void
   }
 }
 
+function spreadsheetValue(value: ExcelJS.CellValue): string | undefined {
+  if (value == null) return undefined
+  if (value instanceof Date) return value.toISOString()
+  if (typeof value !== 'object') return String(value)
+  if ('formula' in value || 'sharedFormula' in value) {
+    const formula = 'formula' in value ? value.formula : value.sharedFormula
+    const result = 'result' in value ? spreadsheetValue(value.result as ExcelJS.CellValue) : undefined
+    return `=${formula}${result === undefined ? ' [hasil belum dihitung]' : ` [hasil tersimpan: ${result}]`}`
+  }
+  if ('richText' in value) return value.richText.map(part => part.text).join('')
+  if ('text' in value) return String(value.text)
+  if ('error' in value) return String(value.error)
+  return undefined
+}
+
+async function extractSpreadsheetText(bytes: Buffer, signal?: AbortSignal): Promise<string> {
+  const workbook = new ExcelJS.Workbook()
+  await workbook.xlsx.load(bytes as any)
+  if (signal?.aborted) throw new Error('SESSION_STOPPED')
+  const lines: string[] = []
+  let length = 0
+  let hasCells = false
+  let partial = workbook.worksheets.length > MAX_XLSX_SHEETS
+  for (const sheet of workbook.worksheets.slice(0, MAX_XLSX_SHEETS)) {
+    if (signal?.aborted) throw new Error('SESSION_STOPPED')
+    const heading = `[Sheet: ${sheet.name}]`
+    lines.push(heading)
+    length += heading.length + 1
+    partial ||= sheet.rowCount > MAX_XLSX_ROWS || sheet.columnCount > MAX_XLSX_COLUMNS
+    for (let rowNumber = 1; rowNumber <= Math.min(sheet.rowCount, MAX_XLSX_ROWS); rowNumber++) {
+      if (signal?.aborted) throw new Error('SESSION_STOPPED')
+      const row = sheet.getRow(rowNumber)
+      for (let column = 1; column <= Math.min(row.cellCount, MAX_XLSX_COLUMNS); column++) {
+        const cell = row.getCell(column)
+        const value = spreadsheetValue(cell.value)
+        if (value !== undefined && value !== '') {
+          const line = `${cell.address}: ${value}`
+          lines.push(line)
+          length += line.length + 1
+          hasCells = true
+        }
+      }
+      if (length >= MAX_EXTRACTED_CHARS) { partial = true; break }
+    }
+    if (length >= MAX_EXTRACTED_CHARS) break
+  }
+  const cleaned = lines.join('\n').trim()
+  if (!hasCells) return partial
+    ? '[Tidak ada sel berisi pada bagian spreadsheet yang dibaca.]\n[Cuplikan spreadsheet terpotong. Jangan menganggap seluruh isi sudah terbaca.]'
+    : '[Spreadsheet kosong atau tidak memiliki isi yang dapat dibaca.]'
+  return cleaned.slice(0, MAX_EXTRACTED_CHARS)
+    + (partial || cleaned.length > MAX_EXTRACTED_CHARS
+      ? '\n[Cuplikan spreadsheet terpotong. Jangan menganggap seluruh isi sudah terbaca.]' : '')
+}
+
 export async function extractDocumentText(bytes: Buffer, format: DocumentFormat,
-  signal?: AbortSignal): Promise<string> {
+  signal?: AbortSignal,
+  ocr?: (bytes: Buffer, kind: 'pdf', signal: AbortSignal | undefined, pages: number[]) => Promise<OcrOutput>): Promise<string> {
   if (signal?.aborted) throw new Error('SESSION_STOPPED')
   await checkedBytes(bytes, format)
   try {
@@ -81,7 +145,11 @@ export async function extractDocumentText(bytes: Buffer, format: DocumentFormat,
     if (format === 'docx') {
       extracted = (await mammoth.extractRawText({ buffer: bytes })).value
       if (signal?.aborted) throw new Error('SESSION_STOPPED')
+    } else if (format === 'xlsx') {
+      return await extractSpreadsheetText(bytes, signal)
     } else {
+      const pageText: string[] = []
+      const scannedPages: number[] = []
       const task = getDocument({ data: new Uint8Array(bytes),
         disableFontFace: true, useSystemFonts: true })
       const abort = () => { void task.destroy() }
@@ -89,23 +157,43 @@ export async function extractDocumentText(bytes: Buffer, format: DocumentFormat,
       try {
         const pdf = await task.promise
         const pages = Math.min(pdf.numPages, MAX_PDF_PAGES)
-        for (let pageNumber = 1; pageNumber <= pages && extracted.length < MAX_EXTRACTED_CHARS; pageNumber++) {
+        let length = 0
+        for (let pageNumber = 1; pageNumber <= pages && length < MAX_EXTRACTED_CHARS; pageNumber++) {
           if (signal?.aborted) throw new Error('SESSION_STOPPED')
           const page = await pdf.getPage(pageNumber)
           const content = await page.getTextContent()
-          extracted += content.items.map(item => 'str' in item ? item.str : '').join(' ') + '\n'
+          const text = content.items.map(item => 'str' in item ? item.str : '').join(' ').trim()
+          pageText.push(text)
+          length += text.length
+          if (text.length < 10) scannedPages.push(pageNumber)
         }
-        partial = pdf.numPages > pages
+        partial = pdf.numPages > pages || pageText.length < pages
       } finally {
         signal?.removeEventListener('abort', abort)
         await task.destroy()
       }
+      if (scannedPages.length) {
+        if (ocr) {
+          try {
+            const result = await ocr(bytes, 'pdf', signal, scannedPages.slice(0, 12))
+            if (signal?.aborted) throw new Error('SESSION_STOPPED')
+            if ('pages' in result) {
+              for (const item of result.pages) pageText[item.page - 1] = item.text
+            }
+          } catch (error) {
+            if (signal?.aborted) throw new Error('SESSION_STOPPED')
+            partial = true
+          }
+        }
+        if (scannedPages.length > 12 || scannedPages.some(page => !pageText[page - 1]?.trim())) partial = true
+      }
+      extracted = pageText.map((text, index) => text ? `[Halaman ${index + 1}]\n${text}` : '').filter(Boolean).join('\n\n')
     }
     const cleaned = extracted.trim()
-    if (!cleaned) return '[Dokumen tidak memiliki teks yang dapat diekstrak. Jangan mengaku sudah membaca isinya; halaman pindai memerlukan OCR.]'
+    if (!cleaned) return '[Dokumen tidak memiliki teks yang dapat diekstrak. OCR halaman pindai belum berhasil; jangan mengaku sudah membaca isinya.]'
     const clipped = cleaned.length > MAX_EXTRACTED_CHARS
     return cleaned.slice(0, MAX_EXTRACTED_CHARS)
-      + (clipped || partial ? '\n[Cuplikan dokumen terpotong. Jangan menganggap seluruh isi sudah terbaca.]' : '')
+      + (clipped || partial ? '\n[Cuplikan dokumen belum lengkap. Jangan menganggap seluruh isi sudah terbaca.]' : '')
   } catch {
     if (signal?.aborted) throw new Error('SESSION_STOPPED')
     throw new Error('DOCUMENT_READ_FAILED')
