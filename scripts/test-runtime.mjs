@@ -1,6 +1,7 @@
 import { after, before, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { DatabaseSync } from 'node:sqlite'
 import * as fs from 'node:fs'
 import * as crypto from 'node:crypto'
 import * as http from 'node:http'
@@ -161,6 +162,7 @@ before(async () => {
         id: 'fixture-user-c', role: 'user', enabled: true,
         channelAliases: { whatsapp: ['user-c@s.whatsapp.net'] },
         allowedDeviceIds: ['fixture-local', 'fixture-companion'],
+        trustedWhatsAppOwner: { name: 'Tan', aliases: ['user-c@s.whatsapp.net'] },
       },
       {
         id: 'fixture-operator', role: 'operator', enabled: true,
@@ -214,6 +216,7 @@ before(async () => {
     'plugins/windows-tools-local.ts', 'plugins/dashboard-api.ts', 'plugins/companion-api.ts',
     'channels/whatsapp-baileys/plugin.ts', 'channels/whatsapp-baileys/emotion.ts',
     'channels/whatsapp-baileys/approval-buttons.ts',
+    'channels/whatsapp-baileys/autonomy.ts',
     'channels/whatsapp-baileys/outbound-screenshot.ts',
     'channels/whatsapp-baileys/format.ts', 'channels/whatsapp-baileys/message-context.ts',
     'channels/whatsapp-baileys/transcription.ts', 'channels/whatsapp-baileys/typing.ts',
@@ -1067,6 +1070,218 @@ describe('offline DSH-loader composition', () => {
     }
   })
 
+  test('owner auto mode cancels a waiting approval, runs reviewed tools, and turns off', async () => {
+    const defaults = ctx.access.state.config.authorities.channelDefaultDeviceIds
+    const previousTarget = defaults.whatsapp
+    defaults.whatsapp = 'fixture-local'
+    const jid = 'user-c@s.whatsapp.net'
+    const sessionId = `whatsapp:${jid}`
+    const agent = ctx.agents.get(RuntimeSessionId(sessionId))
+    assert.ok(agent)
+    const controller = new AbortController()
+    const waitingFile = path.join(fixtureRoot, 'auto-waiting-must-not-write.txt')
+    const approvedFile = path.join(fixtureRoot, 'auto-reviewed-write.txt')
+    const disabledFile = path.join(fixtureRoot, 'auto-off-must-not-write.txt')
+    agent.session.append('turn/start', { turn: 3 })
+    try {
+      const pending = ctx.tools.execute({ callId: ToolCallId('fixture-auto-waiting'), name: 'write',
+        arguments: { file_path: waitingFile, content: 'must not exist' }, agent, signal: controller.signal })
+      const question = await waitFor(() => ctx.access.pendingApprovals('fixture-user-c', 'whatsapp')[0], 'auto waiting approval')
+      const beforeOn = sent.length
+      emitMessage(jid, 'fixture-auto-on', '.auto on')
+      await waitFor(() => sent.slice(beforeOn).some(item => item.remoteJid === jid
+        && item.text?.includes('Mode otomatis aktif')), 'auto on acknowledgment')
+      assert.equal((await pending).isError, true)
+      assert.equal(fs.existsSync(waitingFile), false)
+      assert.equal(ctx.access.answerApproval(question.id, 'fixture-user-c', 'whatsapp', true), false)
+      assert.equal(ctx.access.getAutoMode({ principalId: 'fixture-user-c', originChannel: 'whatsapp', senderAlias: jid }, sessionId), true)
+
+      const result = await ctx.tools.execute({ callId: ToolCallId('fixture-auto-write'), name: 'write',
+        arguments: { file_path: approvedFile, content: 'reviewed auto fixture\n' }, agent, signal: controller.signal })
+      assert.equal(result.isError, false, result.error?.message)
+      assert.equal(fs.readFileSync(approvedFile, 'utf8'), 'reviewed auto fixture\n')
+      assert.equal(ctx.access.pendingApprovals('fixture-user-c', 'whatsapp').length, 0)
+
+      const shellTool = process.platform === 'win32' ? 'pwsh' : 'bash'
+      const shellCommand = process.platform === 'win32'
+        ? 'Write-Output ELARA_AUTO_FIXTURE' : 'printf ELARA_AUTO_FIXTURE'
+      const shell = await ctx.tools.execute({ callId: ToolCallId('fixture-auto-shell'), name: shellTool,
+        arguments: { command: shellCommand, description: 'Harmless auto mode fixture' },
+        agent, signal: controller.signal })
+      assert.equal(shell.isError, false, shell.error?.message)
+      assert.equal(ctx.access.pendingApprovals('fixture-user-c', 'whatsapp').length, 0)
+
+      const enteredGuard = deferred()
+      const releaseGuard = deferred()
+      const staleFile = path.join(fixtureRoot, 'auto-old-instance-must-not-write.txt')
+      const removeBarrier = ctx.on('tools/pre-execute', async (exec, next) => {
+        if (exec.callId === ToolCallId('fixture-auto-old-instance')) {
+          enteredGuard.resolve()
+          await releaseGuard.promise
+        }
+        return next()
+      })
+      try {
+        const stale = ctx.tools.execute({ callId: ToolCallId('fixture-auto-old-instance'), name: 'write',
+          arguments: { file_path: staleFile, content: 'must not exist' }, agent, signal: controller.signal })
+        await enteredGuard.promise
+        const context = { principalId: 'fixture-user-c', originChannel: 'whatsapp', senderAlias: jid }
+        ctx.access.setAutoMode(context, sessionId, false)
+        ctx.access.setAutoMode(context, sessionId, true)
+        releaseGuard.resolve()
+        const staleResult = await stale
+        assert.equal(staleResult.isError, true)
+        assert.match(staleResult.error?.message || '', /AUTO_MODE_REVOKED/)
+        assert.equal(fs.existsSync(staleFile), false)
+      } finally {
+        releaseGuard.resolve()
+        removeBarrier()
+      }
+
+      const beforeWrong = sent.length
+      emitMessage('user-a@s.whatsapp.net', 'fixture-auto-non-owner', '.auto on')
+      await waitFor(() => sent.slice(beforeWrong).some(item => item.remoteJid === 'user-a@s.whatsapp.net'
+        && item.text?.includes('hanya tersedia untuk owner')), 'non-owner auto denial')
+      const beforeOff = sent.length
+      emitMessage(jid, 'fixture-auto-off', '.auto off')
+      await waitFor(() => sent.slice(beforeOff).some(item => item.remoteJid === jid
+        && item.text?.includes('Mode otomatis mati')), 'auto off acknowledgment')
+      assert.equal(ctx.access.getAutoMode({ principalId: 'fixture-user-c', originChannel: 'whatsapp', senderAlias: jid }, sessionId), false)
+      const denied = ctx.tools.execute({ callId: ToolCallId('fixture-auto-off-write'), name: 'write',
+        arguments: { file_path: disabledFile, content: 'must not exist' }, agent, signal: controller.signal })
+      const offQuestion = await waitFor(() => ctx.access.pendingApprovals('fixture-user-c', 'whatsapp')[0], 'approval after auto off')
+      assert.equal(ctx.access.answerApproval(offQuestion.id, 'fixture-user-c', 'whatsapp', false), true)
+      assert.equal((await denied).isError, true)
+      assert.equal(fs.existsSync(disabledFile), false)
+      const audit = ctx.control.listAudit({ principalId: 'fixture-user-c', originChannel: 'whatsapp' }, sessionId)
+      assert.ok(audit.some(row => row.eventType === 'auto_mode_changed' && row.reasonCode === 'AUTO_MODE_ENABLED'))
+      assert.ok(audit.some(row => row.eventType === 'auto_mode_changed' && row.reasonCode === 'AUTO_MODE_DISABLED'))
+      assert.ok(audit.some(row => row.eventType === 'policy_decision' && row.reasonCode === 'AUTO_MODE_ALLOWED'))
+      assert.doesNotMatch(JSON.stringify(audit), /reviewed auto fixture|must not exist/)
+    } finally {
+      defaults.whatsapp = previousTarget
+      controller.abort()
+      agent.session.append('turn/end', { turn: 3, reason: { kind: 'stop' } })
+    }
+  })
+
+  test('owner plans become durable reminders and proactive turns start without user input', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const db = new DatabaseSync(path.join(fixtureRoot, '.runtime', 'whatsapp-autonomy.db'))
+    try {
+      const before = sent.length
+      emitMessage(jid, 'fixture-natural-reminder', 'besok jam 8 rapat')
+      await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('kuingetin')), 'natural reminder acknowledgment')
+      const reminder = db.prepare("SELECT id, status, text FROM whatsapp_reminders WHERE source_id = 'fixture-natural-reminder'").get()
+      assert.equal(reminder.status, 'pending')
+      assert.equal(reminder.text, 'besok jam 8 rapat')
+
+      const questionBefore = sent.length
+      emitMessage(jid, 'fixture-reminder-question', 'kapan rapat besok jam 8?')
+      await waitFor(() => sent.slice(questionBefore).find(item => item.remoteJid === jid
+        && item.text?.includes('fixture:kapan rapat')), 'question handled as conversation')
+      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM whatsapp_reminders WHERE source_id = 'fixture-reminder-question'").get().count, 0)
+
+      const otherBefore = sent.length
+      emitMessage('user-a@s.whatsapp.net', 'fixture-reminder-other-list', '.remind list')
+      await waitFor(() => sent.slice(otherBefore).find(item => item.remoteJid === 'user-a@s.whatsapp.net'
+        && item.text?.includes('belum ada pengingat')), 'other sender reminder isolation')
+      const cancelBefore = sent.length
+      emitMessage(jid, 'fixture-reminder-cancel', `.remind cancel ${reminder.id}`)
+      await waitFor(() => sent.slice(cancelBefore).find(item => item.remoteJid === jid
+        && item.text?.includes('pengingat dibatalkan')), 'reminder cancellation')
+      assert.equal(db.prepare('SELECT status FROM whatsapp_reminders WHERE id = ?').get(reminder.id).status, 'cancelled')
+
+      const commandBefore = sent.length
+      emitMessage(jid, 'fixture-command-reminder', '.remind 10m minum air')
+      await waitFor(() => sent.slice(commandBefore).find(item => item.remoteJid === jid
+        && item.text?.includes('kuingetin')), 'command reminder acknowledgment')
+      db.prepare("UPDATE whatsapp_reminders SET due_at = ? WHERE source_id = 'fixture-command-reminder'").run(Date.now() - 1)
+      const deliveryBefore = sent.length
+      const reminderGate = blockFixtureResponse('fixture reminder turn')
+      try {
+        ctx.emit('elara/test-autonomy-tick', {})
+        await reminderGate.started
+        const agent = ctx.agents.get(RuntimeSessionId(`whatsapp:${jid}`))
+        const blockedFile = path.join(fixtureRoot, 'reminder-must-not-write.txt')
+        const blocked = await ctx.tools.execute({ callId: ToolCallId('fixture-reminder-blocked-tool'), name: 'write',
+          arguments: { file_path: blockedFile, content: 'must not exist' },
+          agent, signal: new AbortController().signal })
+        assert.equal(blocked.isError, true)
+        assert.match(blocked.error?.message || '', /reminder chat cannot use tools/)
+        assert.equal(fs.existsSync(blockedFile), false)
+      } finally { reminderGate.release() }
+      const firstDelivery = await waitFor(() => sent.slice(deliveryBefore).find(item => item.remoteJid === jid
+        && item.text?.startsWith('fixture reminder: ')), 'model-composed reminder delivery')
+      assert.equal(sent.slice(deliveryBefore).some(item => item.text?.includes('*Pengingat*')), false)
+      assert.equal(db.prepare("SELECT status FROM whatsapp_reminders WHERE source_id = 'fixture-command-reminder'").get().status, 'awaiting')
+      const otherReplyBefore = sent.length
+      emitMessage('user-a@s.whatsapp.net', 'fixture-reminder-other-reply', 'oke, makasih')
+      await waitFor(() => sent.slice(otherReplyBefore).find(item => item.remoteJid === 'user-a@s.whatsapp.net'
+        && item.text?.includes('fixture:oke, makasih')), 'other sender ordinary reply')
+      assert.equal(db.prepare("SELECT status FROM whatsapp_reminders WHERE source_id = 'fixture-command-reminder'").get().status, 'awaiting')
+      db.prepare("UPDATE whatsapp_reminders SET due_at = ? WHERE source_id = 'fixture-command-reminder'").run(Date.now() - 1)
+      const repeatBefore = sent.length
+      ctx.emit('elara/test-autonomy-tick', {})
+      const secondDelivery = await waitFor(() => sent.slice(repeatBefore).find(item => item.remoteJid === jid
+        && item.text?.startsWith('fixture reminder: ')), 'model-composed reminder follow-up')
+      assert.notEqual(secondDelivery.text, firstDelivery.text)
+      db.prepare("UPDATE whatsapp_reminders SET due_at = ? WHERE source_id = 'fixture-command-reminder'").run(Date.now() - 1)
+      const thirdBefore = sent.length
+      const pendingGate = blockFixtureResponse('fixture reminder turn')
+      let replyBefore = sent.length
+      try {
+        ctx.emit('elara/test-autonomy-tick', {})
+        await pendingGate.started
+        replyBefore = sent.length
+        emitMessage(jid, 'fixture-reminder-owner-reply', 'oke, udah')
+        await waitFor(() => db.prepare("SELECT status FROM whatsapp_reminders WHERE source_id = 'fixture-command-reminder'")
+          .get().status === 'acknowledged', 'reply acknowledges pending reminder')
+      } finally { pendingGate.release() }
+      await waitFor(() => sent.slice(replyBefore).find(item => item.remoteJid === jid
+        && item.text?.includes('fixture:oke, udah')), 'owner reminder reply')
+      assert.equal(db.prepare("SELECT status FROM whatsapp_reminders WHERE source_id = 'fixture-command-reminder'").get().status, 'acknowledged')
+      assert.equal(sent.slice(thirdBefore).some(item => item.remoteJid === jid
+        && item.text?.startsWith('fixture reminder: ')), false)
+
+      const proactiveBefore = sent.length
+      const proactiveGate = blockFixtureResponse('fixture proactive turn')
+      try {
+        ctx.emit('elara/test-autonomy-tick', { jid })
+        await proactiveGate.started
+        const agent = ctx.agents.get(RuntimeSessionId(`whatsapp:${jid}`))
+        const blockedFile = path.join(fixtureRoot, 'proactive-must-not-write.txt')
+        const blocked = await ctx.tools.execute({ callId: ToolCallId('fixture-proactive-blocked-tool'), name: 'write',
+          arguments: { file_path: blockedFile, content: 'must not exist' },
+          agent, signal: new AbortController().signal })
+        assert.equal(blocked.isError, true)
+        assert.match(blocked.error?.message || '', /proactive chat cannot use tools/)
+        assert.equal(fs.existsSync(blockedFile), false)
+      } finally { proactiveGate.release() }
+      const firstProactive = await waitFor(() => sent.slice(proactiveBefore).find(item => item.remoteJid === jid
+        && item.text?.startsWith('fixture proactive: ')), 'owner proactive message')
+      const firstKind = db.prepare('SELECT last_kind AS kind FROM whatsapp_proactive WHERE principal_id = ?')
+        .get('fixture-user-c').kind
+      assert.equal(firstProactive.text, `fixture proactive: ${firstKind}`)
+      assert.equal(sent.slice(proactiveBefore).some(item => item.remoteJid === 'user-a@s.whatsapp.net'
+        && item.text?.startsWith('fixture proactive: ')), false)
+      const secondBefore = sent.length
+      ctx.emit('elara/test-autonomy-tick', { jid })
+      const secondProactive = await waitFor(() => sent.slice(secondBefore).find(item => item.remoteJid === jid
+        && item.text?.startsWith('fixture proactive: ')), 'varied owner proactive message')
+      const secondKind = db.prepare('SELECT last_kind AS kind FROM whatsapp_proactive WHERE principal_id = ?')
+        .get('fixture-user-c').kind
+      assert.notEqual(secondKind, firstKind)
+      assert.equal(secondProactive.text, `fixture proactive: ${secondKind}`)
+      const offBefore = sent.length
+      emitMessage(jid, 'fixture-proactive-off', '.inisiatif off')
+      await waitFor(() => sent.slice(offBefore).find(item => item.remoteJid === jid
+        && item.text?.includes('chat spontan mati')), 'proactive off')
+      assert.equal(db.prepare('SELECT enabled FROM whatsapp_proactive WHERE principal_id = ?').get('fixture-user-c').enabled, 0)
+    } finally { db.close() }
+  })
+
   test('a fresh session screenshot is delivered as a WhatsApp image, with an honest missing-file result', async () => {
     const jid = 'user-c@s.whatsapp.net'
     const sentBefore = sent.length
@@ -1086,6 +1301,18 @@ describe('offline DSH-loader composition', () => {
     assert.equal(sent.slice(missingStart).some(item => item.remoteJid === jid && item.image), false)
   })
 
+  test('only the exact trusted owner alias receives owner identity in the model context', async () => {
+    emitMessage('user-c@s.whatsapp.net', 'fixture-owner-identity', 'siapa aku fixture owner')
+    const owner = await waitFor(() => requestRows().find(row => row.text === 'siapa aku fixture owner'),
+      'trusted owner model request')
+    assert.equal(owner.trustedSpeakerCount, 1)
+
+    emitMessage('user-a@s.whatsapp.net', 'fixture-nonowner-identity', 'siapa aku fixture nonowner')
+    const other = await waitFor(() => requestRows().find(row => row.text === 'siapa aku fixture nonowner'),
+      'ordinary sender model request')
+    assert.equal(other.trustedSpeakerCount, 0)
+  })
+
   test('trusted WhatsApp ingress preserves quoted context and adaptive typing lifecycle', async () => {
     const jid = 'user-a@s.whatsapp.net'
     const beforeSent = sent.length
@@ -1102,16 +1329,16 @@ describe('offline DSH-loader composition', () => {
     assert.match(quoted.text, /diagram kiri/)
     await waitFor(() => sent.length > beforeSent, 'quoted WhatsApp reply')
 
-    const beforeTyping = typing.length
     const beforePresence = presence.length
     emitMessage(jid, 'fixture-short-typing', 'iya')
-    await waitFor(() => typing.length > beforeTyping, 'short typing plan')
-    const short = typing.at(-1).milliseconds
+    const short = await waitFor(() => typing.find(item => item.jid === jid
+      && item.bubble.includes('fixture:iya'))?.milliseconds, 'short typing plan')
     const longMessage = 'tolong jelaskan langkah pemeriksaan ini secara terperinci untuk proyek fixture '
       + 'dan tunjukkan urutan yang aman untuk menjalankannya'
     emitMessage(jid, 'fixture-long-typing', longMessage)
-    await waitFor(() => typing.length > beforeTyping + 1, 'long typing plan')
-    assert.ok(typing.at(-1).milliseconds > short)
+    const long = await waitFor(() => typing.find(item => item.jid === jid
+      && item.bubble.includes('fixture:tolong jelaskan langkah pemeriksaan ini'))?.milliseconds, 'long typing plan')
+    assert.ok(long > short)
     await waitFor(() => presence.slice(beforePresence).filter(item => item.jid === jid && item.state === 'paused').length >= 2,
       'typing pauses')
     const states = presence.slice(beforePresence).filter(item => item.jid === jid).map(item => item.state)

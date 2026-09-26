@@ -4,7 +4,7 @@ import { CAPABILITY_MATRIX } from './evaluate.ts'
 
 export const AUDIT_SCHEMA_VERSION = 1
 export type AuditEvent = 'policy_decision' | 'approval_requested' | 'approval_resolved' |
-  'dispatch_started' | 'execution_settled' | 'stop_requested' | 'stop_settled'
+  'dispatch_started' | 'execution_settled' | 'stop_requested' | 'stop_settled' | 'auto_mode_changed'
 export type AuditOutcome = 'allowed' | 'denied' | 'requested' | 'rejected' |
   'expired' | 'cancelled' | 'failed' | 'completed' | 'unknown' | 'stopping' | 'stopped' | 'idle' | 'unconfirmed'
 
@@ -33,7 +33,7 @@ export function auditId(): string { return randomUUID() }
 
 const knownEvents = new Set<AuditEvent>([
   'policy_decision', 'approval_requested', 'approval_resolved', 'dispatch_started',
-  'execution_settled', 'stop_requested', 'stop_settled',
+  'execution_settled', 'stop_requested', 'stop_settled', 'auto_mode_changed',
 ])
 const knownOutcomes = new Set<AuditOutcome>([
   'allowed', 'denied', 'requested', 'rejected', 'expired', 'cancelled', 'failed',

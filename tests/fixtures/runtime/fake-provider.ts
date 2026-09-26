@@ -43,10 +43,26 @@ class FixtureAdapter {
     const personaCount = [...options.messages]
       .flatMap(message => message.content.filter(block => block.type === 'text').map(block => block.text))
       .join('\n').match(/You are ELARA/g)?.length || 0
-    const text = [...options.messages].reverse()
-      .find(message => message.role === 'user' && message.source.kind === 'user')
-      ?.content.filter(block => block.type === 'text').map(block => block.text).join('') || ''
-    const response = `fixture:${text}`
+    const trustedSpeakerCount = options.messages.filter(message =>
+      message.source.kind === 'plugin' && message.source.plugin === 'elara-trusted-speaker').length
+    const latestUser = [...options.messages].reverse().find(message => message.role === 'user'
+      && (message.source.kind === 'user' || message.source.kind === 'plugin'
+        && ['elara-proactive', 'elara-reminder'].includes(message.source.plugin)))
+    const proactive = latestUser?.source.kind === 'plugin' && latestUser.source.plugin === 'elara-proactive'
+    const reminder = latestUser?.source.kind === 'plugin' && latestUser.source.plugin === 'elara-reminder'
+    const text = proactive ? 'fixture proactive turn' : reminder ? 'fixture reminder turn'
+      : latestUser?.source.kind === 'user'
+      ? latestUser.content.filter(block => block.type === 'text').map(block => block.text).join('') : ''
+    const pluginPrompt = proactive || reminder ? (latestUser?.content || []).filter(block => block.type === 'text')
+      .map(block => block.text).join('') : ''
+    const proactiveKind = pluginPrompt.includes('topik terbuka') ? 'followup'
+      : pluginPrompt.includes('pertanyaan penasaran') ? 'curiosity'
+      : pluginPrompt.includes('permainan kecil') ? 'playful'
+      : pluginPrompt.includes('pemikiran atau pengamatan') ? 'thought'
+      : pluginPrompt.includes('check-in') ? 'checkin' : 'unknown'
+    const reminderMood = /Nuansa kali ini: ([^.]+)\./u.exec(pluginPrompt)?.[1] || 'unknown'
+    const response = proactive ? `fixture proactive: ${proactiveKind}`
+      : reminder ? `fixture reminder: ${reminderMood}` : `fixture:${text}`
     const block = blocks.get(text)
     if (block) {
       block.entered()
@@ -69,7 +85,8 @@ class FixtureAdapter {
     }
     const logPath = process.env.ELARA_RUNTIME_REQUEST_LOG
     if (logPath) {
-      fs.appendFileSync(logPath, `${JSON.stringify({ text, messageCount: options.messages.length, personaCount })}\n`, 'utf8')
+      fs.appendFileSync(logPath, `${JSON.stringify({ text, messageCount: options.messages.length,
+        personaCount, trustedSpeakerCount })}\n`, 'utf8')
     }
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'text-delta', index: 0, text: response }

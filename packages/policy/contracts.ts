@@ -24,6 +24,7 @@ export interface Principal {
   enabled: boolean
   channelAliases: Partial<Record<OriginChannel, string[]>>
   allowedDeviceIds: string[]
+  trustedWhatsAppOwner?: { name: string; aliases: string[] }
 }
 
 export interface DeviceDefinition {

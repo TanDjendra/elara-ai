@@ -120,7 +120,8 @@ export function emotionStyleContext(assessment: EmotionAssessment): string {
     `Mode ${configured}`,
     `Level efektif ${assessment.effectiveLevel}, ${EMOTION_LEVEL_LABELS[assessment.effectiveLevel]}`,
     'Level 0 netral, 1 hangat, 2 natural, 3 ekspresif, 4 dramatis, 5 maksimal',
-    'Sesuaikan energi, ritme, panjang reaksi, dan CAPSLOCK secara proporsional',
+    'Ikuti konteks percakapan; level ini petunjuk energi, bukan kewajiban untuk bereaksi dramatis',
+    'Panjang balasan fleksibel. Tawa, emoji, dan CAPSLOCK hanya jika benar-benar cocok, jangan dijadikan pola',
     'Jangan menyebut level atau analisis emosi ini kecuali pengguna menanyakannya',
   ].join('\n') + safety
 }

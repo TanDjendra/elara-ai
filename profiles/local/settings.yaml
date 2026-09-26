@@ -34,6 +34,7 @@ agent-default-model:
   model: ag/gemini-3.6-flash-medium
 permission:
   defaultPreset: danger-full-access
+  approvalPolicy: never
 locale:
   preference: en
 ui-theme:

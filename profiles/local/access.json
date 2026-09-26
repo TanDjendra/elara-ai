@@ -2,8 +2,16 @@
   "schemaVersion": 1,
   "policyVersion": "elara-p2a-v1.1",
   "devices": [
-    { "id": "local-windows", "kind": "local", "enabled": true },
-    { "id": "companion-example", "kind": "companion", "enabled": false }
+    {
+      "id": "local-windows",
+      "kind": "local",
+      "enabled": true
+    },
+    {
+      "id": "companion-example",
+      "kind": "companion",
+      "enabled": false
+    }
   ],
   "principals": [
     {
@@ -11,18 +19,35 @@
       "role": "operator",
       "enabled": true,
       "channelAliases": {
-        "dashboard": ["local-dashboard"]
+        "dashboard": [
+          "local-dashboard"
+        ]
       },
-      "allowedDeviceIds": ["local-windows"]
+      "allowedDeviceIds": [
+        "local-windows"
+      ]
     },
     {
       "id": "whatsapp-tester",
       "role": "user",
       "enabled": true,
       "channelAliases": {
-        "whatsapp": ["62882007767137@s.whatsapp.net", "628132661159@s.whatsapp.net", "198454030684321@lid", "192161383485490@lid"]
+        "whatsapp": [
+          "62882007767137@s.whatsapp.net",
+          "628132661159@s.whatsapp.net",
+          "198454030684321@lid",
+          "192161383485490@lid"
+        ]
       },
-      "allowedDeviceIds": ["local-windows"]
+      "allowedDeviceIds": [
+        "local-windows"
+      ],
+      "trustedWhatsAppOwner": {
+        "name": "Tan",
+        "aliases": [
+          "192161383485490@lid"
+        ]
+      }
     }
   ],
   "authorities": {

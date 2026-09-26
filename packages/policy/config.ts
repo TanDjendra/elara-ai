@@ -68,7 +68,7 @@ export function validateAccessConfig(value: unknown): AccessConfig {
   const aliases = new Map<string, string>()
   const principals: Principal[] = root.principals.map((entry, index) => {
     const item = object(entry, `principals[${index}]`)
-    exactKeys(item, ['id', 'role', 'enabled', 'channelAliases', 'allowedDeviceIds'], `principals[${index}]`)
+    exactKeys(item, ['id', 'role', 'enabled', 'channelAliases', 'allowedDeviceIds', 'trustedWhatsAppOwner'], `principals[${index}]`)
     const id = identifier(item.id, `principals[${index}].id`)
     if (item.role !== 'operator' && item.role !== 'user') throw new Error(`principals[${index}].role is invalid`)
     if (typeof item.enabled !== 'boolean') throw new Error(`principals[${index}].enabled must be boolean`)
@@ -92,7 +92,18 @@ export function validateAccessConfig(value: unknown): AccessConfig {
     if (allowedDeviceIds.some(deviceId => !deviceIds.has(deviceId))) {
       throw new Error(`principals[${index}].allowedDeviceIds contains an unknown device`)
     }
-    return { id, role: item.role, enabled: item.enabled, channelAliases, allowedDeviceIds }
+    let trustedWhatsAppOwner: Principal['trustedWhatsAppOwner']
+    if (item.trustedWhatsAppOwner !== undefined) {
+      const owner = object(item.trustedWhatsAppOwner, `principals[${index}].trustedWhatsAppOwner`)
+      exactKeys(owner, ['name', 'aliases'], `principals[${index}].trustedWhatsAppOwner`)
+      const name = exactString(owner.name, `principals[${index}].trustedWhatsAppOwner.name`)
+      const ownerAliases = stringArray(owner.aliases, `principals[${index}].trustedWhatsAppOwner.aliases`)
+      if (!ownerAliases.length || ownerAliases.some(alias => !channelAliases.whatsapp?.includes(alias))) {
+        throw new Error(`principals[${index}].trustedWhatsAppOwner must use configured WhatsApp aliases`)
+      }
+      trustedWhatsAppOwner = { name, aliases: ownerAliases }
+    }
+    return { id, role: item.role, enabled: item.enabled, channelAliases, allowedDeviceIds, trustedWhatsAppOwner }
   })
   const principalIds = new Set(principals.map(principal => principal.id))
   if (principalIds.size !== principals.length) throw new Error('principal ids must be unique')

@@ -36,6 +36,12 @@ export interface DirectExecutionRequest {
   signal?: AbortSignal
 }
 
+export interface AutoModeContext {
+  principalId: string
+  originChannel: OriginChannel
+  senderAlias: string
+}
+
 export interface AccessService {
   readonly state: AccessConfigState
   principalForAlias(channel: OriginChannel, alias: string): Principal | undefined
@@ -49,6 +55,8 @@ export interface AccessService {
   decideDirect(request: DirectExecutionRequest): PolicyDecision
   executeDirect<T>(request: DirectExecutionRequest, operation: () => Promise<T>): Promise<T>
   pendingApprovals(principalId: string, channel: OriginChannel): PendingApproval[]
+  setAutoMode(context: AutoModeContext, sessionId: string, enabled: boolean): { enabled: boolean; pendingCancelled: boolean }
+  getAutoMode(context: AutoModeContext, sessionId: string): boolean
   answerApproval(id: string, principalId: string, channel: OriginChannel, allow: boolean): boolean
   onApproval(listener: (view: PendingApproval) => void | Promise<void>): () => void
   cancelSessionApprovals(sessionIds: readonly string[]): void
@@ -98,6 +106,8 @@ export function apply(ctx: Context) {
   })
   const grants = new Map<ToolExecution['token'], string>()
   const approvedScopes = new Map<ToolExecution['token'], string>()
+  const autoGrants = new Map<ToolExecution['token'], string>()
+  const autoSessions = new Map<string, { id: string; principalId: string; senderAlias: string }>()
   const ownRequests = new WeakMap<ApprovalRequest, { exec: Readonly<ToolExecution>, accepted: boolean }>()
   const liveExecutions = new Map<ToolExecution['token'], Readonly<ToolExecution>>()
   const trackedExecutions = new Map<ToolExecution['token'], Readonly<ToolExecution>>()
@@ -143,6 +153,32 @@ export function apply(ctx: Context) {
   function targetFor(binding: SessionBinding | undefined): string {
     if (!binding) return 'unbound'
     return state.config?.authorities.channelDefaultDeviceIds[binding.originChannel] || 'unconfigured'
+  }
+
+  function authorizeAutoMode(context: AutoModeContext, sessionId: string): Principal {
+    const binding = store.bindingFor(sessionId)
+    const principal = state.config?.principals.find(item => item.id === context.principalId && item.enabled)
+    if (context.originChannel !== 'whatsapp' || !binding || binding.principalId !== context.principalId
+      || binding.originChannel !== 'whatsapp' || !principal?.trustedWhatsAppOwner?.aliases.includes(context.senderAlias)
+      || targetFor(binding) !== state.config?.authorities.hostDeviceId
+      || process.env.ELARA_MODE === 'cloud') throw new Error('AUTO_MODE_NOT_ALLOWED')
+    return principal
+  }
+
+  function autoModeForAgent(agent: Agent | undefined, binding: SessionBinding | undefined,
+    principal: Principal | undefined): boolean {
+    const rootId = scopeForAgent(agent)
+    const active = rootId ? autoSessions.get(rootId) : undefined
+    return !!active && !!binding && !!principal && binding.originChannel === 'whatsapp'
+      && active.principalId === principal.id
+      && !!principal.trustedWhatsAppOwner?.aliases.includes(active.senderAlias)
+  }
+
+  function autoGrantCurrent(exec: Readonly<ToolExecution>): boolean {
+    const id = autoGrants.get(exec.token)
+    const rootId = scopeForAgent(exec.agent)
+    return !!id && !!rootId && autoSessions.get(rootId)?.id === id
+      && autoModeForAgent(exec.agent, bindingForAgent(exec.agent), principalForAgent(exec.agent))
   }
 
   function record(context: ExecutionContext, decision: PolicyDecision, operationId = auditId(), auditSessionId = context.sessionId): void {
@@ -199,7 +235,12 @@ export function apply(ctx: Context) {
       source: exec.parent ? 'dsh:nested-tool' : 'dsh:tool',
       signal: exec.signal,
     }
-    const decision = evaluatePolicy(state.config, context, capability, binding?.principalId)
+    const baseDecision = evaluatePolicy(state.config, context, capability, binding?.principalId)
+    const decision = baseDecision.outcome === 'approval_required' && approvableTools.has(exec.name)
+      && targetFor(binding) === state.config?.authorities.hostDeviceId
+      && runtimeMode !== 'cloud' && autoModeForAgent(exec.agent, binding, principal)
+      ? { ...baseDecision, outcome: 'allow' as const, reasonCode: 'AUTO_MODE_ALLOWED' }
+      : baseDecision
     if (shouldRecord) record(context, decision, correlation.get(exec.token)?.operationId, scopeForAgent(exec.agent))
     return decision
   }
@@ -215,7 +256,7 @@ export function apply(ctx: Context) {
     const binding = bindingForAgent(exec.agent)
     const principal = principalForAgent(exec.agent)
     if (exec.signal.aborted || staleExecutions.has(exec.token) || !binding || !principal || !approvableTools.has(exec.name)
-      || decision.outcome !== 'approval_required'
+      || (decision.outcome !== 'approval_required' && decision.reasonCode !== 'AUTO_MODE_ALLOWED')
       || targetFor(binding) !== state.config?.authorities.hostDeviceId
       || process.env.ELARA_MODE === 'cloud') return undefined
     return JSON.stringify({ principal: principal.id, session: exec.agent?.id,
@@ -233,7 +274,8 @@ export function apply(ctx: Context) {
     const scope = approvalScope(exec)
     const binding = bindingForAgent(exec.agent)
     if (!scope || !binding) return 'unavailable'
-    if (!owned && liveExecutions.get(exec.token) === exec && approvedScopes.get(exec.token) === scope) {
+    if (!owned && liveExecutions.get(exec.token) === exec && approvedScopes.get(exec.token) === scope
+      && (!autoGrants.has(exec.token) || autoGrantCurrent(exec))) {
       // DSH's sandbox is asking about the same execution after ELARA's one-time
       // approval. Reuse that exact frozen scope; do not create a second grant.
       return 'allowed-once'
@@ -355,6 +397,42 @@ export function apply(ctx: Context) {
       const principal = state.config?.principals.find(item => item.id === principalId && item.enabled)
       return principal ? inbox.list(principalId, channel) : []
     },
+    setAutoMode(context, sessionId, enabled) {
+      authorizeAutoMode(context, sessionId)
+      if (enabled) {
+        const current = autoSessions.get(sessionId)
+        if (current?.principalId !== context.principalId || current.senderAlias !== context.senderAlias) {
+          if (auditDegraded) throw new Error('AUDIT_UNAVAILABLE')
+          service.recordAudit({ schemaVersion: 1, operationId: auditId(), principalId: context.principalId,
+            sessionId, originChannel: 'whatsapp', targetDeviceId: targetFor(store.bindingFor(sessionId)),
+            policyVersion: state.config?.policyVersion, eventType: 'auto_mode_changed',
+            reasonCode: 'AUTO_MODE_ENABLED', outcome: 'allowed', createdAt: Date.now() })
+          autoSessions.set(sessionId, { id: auditId(), principalId: context.principalId,
+            senderAlias: context.senderAlias })
+        }
+        const root = ctx.agents.list().find(agent => String(agent.id) === sessionId)
+        const affected = root
+          ? ctx.agents.list().filter(agent => agent === root || ctx.agents.isOwnedBy(agent.id, root))
+            .map(agent => String(agent.id)) : [sessionId]
+        const ids = new Set(affected)
+        const pendingCancelled = inbox.list(context.principalId, 'whatsapp')
+          .some(view => ids.has(view.sessionId) || !!view.scopeSessionId && ids.has(view.scopeSessionId))
+        for (const id of ids) inbox.cancelSession(id)
+        return { enabled: true, pendingCancelled }
+      }
+      autoSessions.delete(sessionId)
+      try { service.recordAudit({ schemaVersion: 1, operationId: auditId(), principalId: context.principalId,
+        sessionId, originChannel: 'whatsapp', targetDeviceId: targetFor(store.bindingFor(sessionId)),
+        policyVersion: state.config?.policyVersion, eventType: 'auto_mode_changed',
+        reasonCode: 'AUTO_MODE_DISABLED', outcome: 'completed', createdAt: Date.now() }) }
+      catch { /* Disabling permission must still succeed if audit storage fails. */ }
+      return { enabled: false, pendingCancelled: false }
+    },
+    getAutoMode(context, sessionId) {
+      authorizeAutoMode(context, sessionId)
+      const active = autoSessions.get(sessionId)
+      return active?.principalId === context.principalId && active.senderAlias === context.senderAlias
+    },
     answerApproval(id, principalId, channel, allow) {
       const principal = state.config?.principals.find(item => item.id === principalId && item.enabled)
       return !!principal && inbox.answer(id, principalId, channel, allow)
@@ -363,6 +441,7 @@ export function apply(ctx: Context) {
     cancelSessionApprovals(sessionIds) { for (const id of sessionIds) inbox.cancelSession(id) },
     revokeSessionGrants(sessionIds, stopRequestId) {
       const scope = new Set(sessionIds)
+      for (const id of scope) autoSessions.delete(id)
       for (const [token, exec] of trackedExecutions) {
         if (exec.agent && scope.has(String(exec.agent.id))) {
           staleExecutions.add(token)
@@ -373,6 +452,7 @@ export function apply(ctx: Context) {
         if (exec.agent && scope.has(String(exec.agent.id))) {
           grants.delete(token)
           approvedScopes.delete(token)
+          autoGrants.delete(token)
           liveExecutions.delete(token)
         }
       }
@@ -411,6 +491,17 @@ export function apply(ctx: Context) {
     const decision = decisionForTool(exec, true)
     if (decision.capability.risk === 'sensitive' && auditDegraded) {
       return { kind: 'deny' as const, reason: 'ELARA access denied (AUDIT_UNAVAILABLE)' }
+    }
+    if (decision.reasonCode === 'AUTO_MODE_ALLOWED') {
+      const scope = approvalScope(exec)
+      const rootId = scopeForAgent(exec.agent)
+      const active = rootId ? autoSessions.get(rootId) : undefined
+      if (!scope || !active) return { kind: 'deny' as const, reason: 'ELARA access denied (AUTO_MODE_REVOKED)' }
+      grants.set(exec.token, scope)
+      approvedScopes.set(exec.token, scope)
+      autoGrants.set(exec.token, active.id)
+      liveExecutions.set(exec.token, exec)
+      return next()
     }
     if (decision.outcome === 'allow') return next()
     const scope = approvalScope(exec)
@@ -464,7 +555,11 @@ export function apply(ctx: Context) {
     const decision = decisionForTool(exec, false)
     const grant = grants.get(exec.token)
     grants.delete(exec.token)
-    const allowed = (grant && approvalScope(exec) === grant) || decision.outcome === 'allow'
+    const grantValid = !!grant && approvalScope(exec) === grant
+      && (!autoGrants.has(exec.token) || autoGrantCurrent(exec))
+    const allowed = grantValid || (decision.outcome === 'allow' && decision.reasonCode !== 'AUTO_MODE_ALLOWED')
+    const denialReason = autoGrants.has(exec.token) || decision.reasonCode === 'AUTO_MODE_ALLOWED'
+      ? 'AUTO_MODE_REVOKED' : decision.reasonCode
     const binding = bindingForAgent(exec.agent)
     if (binding) {
       try {
@@ -483,15 +578,16 @@ export function apply(ctx: Context) {
           service.recordAudit({ schemaVersion: 1, operationId: correlation.get(exec.token)?.operationId ?? auditId(), principalId: binding.principalId,
             sessionId: scopeForAgent(exec.agent) ?? binding.sessionId, originChannel: binding.originChannel,
             capabilityId: decision.capability.id, policyVersion: decision.policyVersion,
-            eventType: 'policy_decision', reasonCode: decision.reasonCode, outcome: 'denied', createdAt: Date.now() })
+            eventType: 'policy_decision', reasonCode: denialReason, outcome: 'denied', createdAt: Date.now() })
         }
       } catch { if (decision.capability.risk === 'sensitive') return 'ELARA access denied (AUDIT_UNAVAILABLE)' }
     }
-    return allowed ? undefined : denialText(decision)
+    return allowed ? undefined : `ELARA access denied (${denialReason})`
   })
   ctx.on('tools/result', (exec, result) => {
     const entry = executionAudit.get(exec.token)
     approvedScopes.delete(exec.token)
+    autoGrants.delete(exec.token)
     executionAudit.delete(exec.token)
     correlation.delete(exec.token)
     trackedExecutions.delete(exec.token)
@@ -514,7 +610,7 @@ export function apply(ctx: Context) {
     liveExecutions.delete(exec.token)
     return undefined
   })
-  ctx.effect(() => () => { inbox.close(); grants.clear(); liveExecutions.clear(); trackedExecutions.clear(); staleExecutions.clear(); stopForExecution.clear() })
+  ctx.effect(() => () => { inbox.close(); grants.clear(); autoGrants.clear(); autoSessions.clear(); liveExecutions.clear(); trackedExecutions.clear(); staleExecutions.clear(); stopForExecution.clear() })
   ctx.effect(() => () => store.close())
 
   if (!state.enabled) console.error(`[ELARA-ACCESS] ${state.diagnostic}`)

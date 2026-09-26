@@ -82,6 +82,15 @@ describe('access configuration', () => {
     assert.throws(() => validateAccessConfig(value), /unknown fields/)
   })
 
+  test('trusted owner identity must name an exact configured WhatsApp alias', () => {
+    const value = config()
+    value.principals[0].trustedWhatsAppOwner = { name: 'Tan', aliases: ['alice@s.whatsapp.net'] }
+    assert.deepEqual(validateAccessConfig(value).principals[0].trustedWhatsAppOwner,
+      { name: 'Tan', aliases: ['alice@s.whatsapp.net'] })
+    value.principals[0].trustedWhatsAppOwner.aliases = ['unlisted@lid']
+    assert.throws(() => validateAccessConfig(value), /configured WhatsApp aliases/)
+  })
+
   test('requires an enabled local device as the actual DSH host', () => {
     const missing = config()
     delete missing.authorities.hostDeviceId
