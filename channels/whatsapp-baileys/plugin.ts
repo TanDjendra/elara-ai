@@ -25,6 +25,7 @@ import { splitIntoBubbles } from './format.ts'
 import { combineQuotedContext, summarizeQuotedContent, type QuotedSummary } from './message-context.ts'
 import { transcribeAudio, transcriptionConfig } from './transcription.ts'
 import { parseTypingSpeed, typingDelayMs } from './typing.ts'
+import { WhatsAppSettings, validTyping } from './settings.ts'
 import { approvalButtonAnswer, approvalButtonContent, approvalButtonId, approvalPreviewText,
   approvalQuotedAnswer, approvalReactionAnswer } from './approval-buttons.ts'
 import { isScreenshotRequest, prepareScreenshotTarget, readScreenshot } from './outbound-screenshot.ts'
@@ -32,8 +33,14 @@ import { documentFormat, extractDocumentText, isDocumentSendRequest, prepareDocu
   readOutboundDocument, requestedDocumentFormats } from './document-media.ts'
 import { runLocalOcr } from './ocr-local.ts'
 import { downloadPublicFile, isDownloadRequest, requestedDownloadUrl } from './link-download.ts'
+import { assertOggOpus, voicePrompt, voiceReplyRequested, voiceSynthesizer,
+  type VoiceSynthesizer } from './outbound-voice.ts'
+import { HermesProjectJobs, type HermesProjectTransport,
+  type ProjectJob } from './hermes-project.ts'
 import { AutonomyStore, commandReminder, inferReminder, nextProactiveKind, nextReminderTone,
-  type ProactiveKind, type ProactiveRow, type ReminderRow, type ReminderTone } from './autonomy.ts'
+  type CalendarLink, type ProactiveKind, type ProactiveRow, type ReminderRow, type ReminderTone } from './autonomy.ts'
+import { CalendarBridge, GoogleCalendarClient, calendarEventId, type CalendarTransport } from './google-calendar.ts'
+import { CalendarAuth } from './calendar-auth.ts'
 
 export { splitIntoBubbles } from './format.ts'
 
@@ -75,9 +82,10 @@ function userSafeError(error: unknown): string {
   if (message.startsWith('DOCUMENT_')) return 'Dokumennya belum berhasil kubaca atau kukirim. Pastikan berkas DOCX/PDF/XLSX-nya valid, lalu coba lagi ya.'
   if (message === 'DOWNLOAD_SEND_UNCONFIRMED') return 'File sudah tersimpan di laptop, tapi pengirimannya ke WhatsApp belum bisa kupastikan. Cek chat dulu sebelum minta kirim ulang ya.'
   if (message.startsWith('DOWNLOAD_')) return 'File dari tautan itu belum berhasil kuunduh. Pakai tautan HTTPS publik langsung ke PDF, DOCX, XLSX, TXT, CSV, JSON, ZIP, PNG, JPG, atau WEBP (maksimal 25 MB).'
-  if (message === 'AUDIT_UNAVAILABLE') return 'Unduhan belum dijalankan karena pencatatan audit sedang bermasalah. Coba lagi setelah layanan pulih ya.'
+  if (message === 'AUDIT_UNAVAILABLE') return 'Operasi belum dijalankan karena pencatatan audit sedang bermasalah. Coba lagi setelah layanan pulih ya.'
   if (message.startsWith('Lampirannya lebih dari 25 MB')) return message
   if (message.startsWith('Voice note')) return message
+  if (message.startsWith('HERMES_')) return 'Mode proyek Hermes belum bisa menjalankan tugas itu. Cek statusnya lewat .hermes status.'
   if (message.includes('possible secret')) return 'aku nggak menyimpan teks itu karena kelihatannya mengandung data rahasia'
   return 'ada kendala internal waktu memproses pesanmu, coba kirim lagi sebentar ya'
 }
@@ -143,6 +151,16 @@ export function apply(ctx: Context) {
   let autonomy: AutonomyStore | undefined
   try { autonomy = new AutonomyStore(path.resolve(rootDir, '.runtime', 'whatsapp-autonomy.db')) }
   catch { console.error('[ELARA] WhatsApp reminder storage unavailable') }
+  const calendarAuth = new CalendarAuth(rootDir)
+  let calendarTransport: CalendarTransport | undefined = calendarAuth.configured()
+    ? new GoogleCalendarClient(signal => calendarAuth.accessToken(signal)) : undefined
+  ctx.on('elara/test-calendar-handler' as any, (handler: CalendarTransport | undefined) => {
+    if (process.env.ELARA_MOCK_WA === '1') { calendarTransport = handler; armAutonomy() }
+  })
+  let outboundVoice: VoiceSynthesizer | undefined = voiceSynthesizer(rootDir)
+  ctx.on('elara/test-whatsapp-voice-handler' as any, (handler: VoiceSynthesizer | undefined) => {
+    if (process.env.ELARA_MOCK_WA === '1') outboundVoice = handler
+  })
 
   let sessionState: Record<string, string> = {}
   try {
@@ -157,23 +175,7 @@ export function apply(ctx: Context) {
     fs.renameSync(temporary, statePath)
   }
 
-  let emotionPreferences: Record<string, EmotionMode> = {}
-  try {
-    const parsed = JSON.parse(fs.readFileSync(preferencesPath, 'utf8'))
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      for (const [key, value] of Object.entries(parsed)) {
-        const mode = parseEmotionMode(String(value))
-        if (mode !== undefined) emotionPreferences[key] = mode
-      }
-    }
-  } catch (error: any) {
-    if (error?.code !== 'ENOENT') console.warn('[ELARA] WhatsApp preferences were unreadable; using auto emotion')
-  }
-  const saveEmotionPreferences = () => {
-    const temporary = `${preferencesPath}.tmp`
-    fs.writeFileSync(temporary, JSON.stringify(emotionPreferences, null, 2), { encoding: 'utf8', mode: 0o600 })
-    fs.renameSync(temporary, preferencesPath)
-  }
+  const settings = new WhatsAppSettings(preferencesPath, parseTypingSpeed(process.env.ELARA_TYPING_SPEED))
 
   const agentHandles = new Map<string, any>()
   const ownerIdentityInjected = new WeakSet<object>()
@@ -195,7 +197,6 @@ export function apply(ctx: Context) {
     console.log(`[ELARA] WhatsApp ingress: ${reason}`)
   }
   const logger = pino({ level: process.env.ELARA_WA_LOG_LEVEL || 'silent' })
-  const typingSpeed = parseTypingSpeed(process.env.ELARA_TYPING_SPEED)
   // These functions are replaced after the real Baileys module loads. Keep
   // them per plugin instance so parallel profiles cannot alter one another.
   let extractMessageContent = (message: any): any => message?.ephemeralMessage?.message
@@ -220,6 +221,7 @@ export function apply(ctx: Context) {
   let autonomyPump: Promise<void> | undefined
   let connected = process.env.ELARA_MOCK_WA === '1'
   const outboundAgents = new Map<Agent, 'proactive' | 'reminder'>()
+  const calendarOperations = new Map<number, Promise<string>>()
   const outboundKind = (agent: Agent | undefined) => agent && [...outboundAgents].find(([root]) =>
     agent === root || ctx.agents.isOwnedBy(agent.id, root))?.[1]
   const outboundDenial = (agent: Agent | undefined) => {
@@ -285,11 +287,47 @@ export function apply(ctx: Context) {
     await socket.relayMessage(jid, message.message, { messageId: message.key.id })
   }
 
-  const sessionFor = (jid: string) => sessionState[userKey(jid)] || `whatsapp:${jid}`
+  const sessionFor = (jid: string) => {
+    const member = ctx.access.principalForAlias('whatsapp', jid)
+    const saved = sessionState[userKey(jid)]
+    if (!member?.chatOnly) return saved || `whatsapp:${jid}`
+    const prefix = `whatsapp:${userKey(jid)}:${member.id}:`
+    return saved?.startsWith(prefix) ? saved : `${prefix}root`
+  }
   const memoryOwnerFor = (principal: Principal) => principal.id
-  const emotionModeFor = (jid: string): EmotionMode => emotionPreferences[userKey(jid)] ?? 'auto'
+  const emotionModeFor = (jid: string): EmotionMode => settings.emotion(userKey(jid))
   const isOwnerAlias = (principal: Principal, jid: string) =>
     !!principal.trustedWhatsAppOwner?.aliases.includes(jid)
+  const projectAdmissions = new Map<string, SessionAdmission>()
+  const projectNotifications = new Map<string, string>()
+  const projectName = 'proyek contoh'
+  const makeProjectJobs = (transport: HermesProjectTransport) => new HermesProjectJobs(
+    ctx.control, ctx.access, transport, (job: ProjectJob) => {
+      const previous = projectNotifications.get(job.id)
+      if (previous === job.state) return
+      projectNotifications.set(job.id, job.state)
+      const admission = projectAdmissions.get(job.id)
+      if (!admission) return
+      try { ctx.control.assertCurrent(admission) } catch { return }
+      const owner = ctx.access.principalForAlias('whatsapp', job.senderAlias)
+      if (!owner || owner.id !== job.principalId || !isOwnerAlias(owner, job.senderAlias)) return
+      const note = job.state === 'running' ? `Hermes mulai mengerjakan ${projectName}. Cek .hermes status untuk progres.`
+        : job.state === 'completed' ? 'Hermes selesai. Kirim .hermes review untuk melihat laporannya.'
+          : job.state === 'cancelled' ? job.unconfirmed
+            ? 'Hermes melaporkan run dibatalkan. Penghentian proses turunannya belum diverifikasi oleh ELARA.'
+            : 'Hermes berhenti. Proses milik tugas contoh sudah terverifikasi berakhir.'
+            : job.state === 'failed' ? 'Hermes melaporkan tugas gagal. Cek .hermes review.'
+              : job.state === 'unknown' ? 'Status pekerjaan Hermes belum bisa dipastikan. Cek .hermes status sebelum memulai tugas baru.'
+                : job.state === 'waiting_for_approval' ? 'Hermes meminta persetujuan yang belum tersambung ke ELARA. Stop sedang diminta.' : undefined
+      if (note) void sendWA(job.senderAlias, { text: note }).catch(() => undefined)
+      if (['completed', 'cancelled', 'failed', 'interrupted', 'unknown'].includes(job.state))
+        projectAdmissions.delete(job.id)
+    }, 1000)
+  let projectJobs: HermesProjectJobs | undefined
+  // The pilot is fixture-only until an isolated Hermes workspace and approval bridge are verified.
+  ctx.on('elara/test-whatsapp-hermes-handler' as any, (handler: HermesProjectTransport | undefined) => {
+    if (process.env.ELARA_MOCK_WA === '1') projectJobs = handler ? makeProjectJobs(handler) : undefined
+  })
   const resolveSender = (principalId: string, senderKey: string, ownerOnly: boolean): string | undefined => {
     const principal = ctx.access.state.config?.principals.find(item => item.id === principalId && item.enabled)
     return principal?.channelAliases.whatsapp?.find(alias => userKey(alias) === senderKey
@@ -299,11 +337,94 @@ export function apply(ctx: Context) {
     weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit',
   }).format(new Date(dueAt))
 
+  function syncCalendarLink(link: CalendarLink, admission: SessionAdmission): Promise<string> {
+    const previous = calendarOperations.get(link.reminderId) ?? Promise.resolve('unchanged')
+    const next = previous.catch(() => 'pending').then(() => {
+      ctx.control.assertCurrent(admission)
+      const current = autonomy?.calendarLink(link.principalId, link.senderKey, link.reminderId)
+      if (!current || current.state === 'deleted') return 'deleted'
+      return syncCalendarLinkUnqueued(current, admission)
+    })
+    calendarOperations.set(link.reminderId, next)
+    const release = () => { if (calendarOperations.get(link.reminderId) === next) calendarOperations.delete(link.reminderId) }
+    void next.then(release, release)
+    return next
+  }
+
+  async function syncCalendarLinkUnqueued(link: CalendarLink, admission: SessionAdmission): Promise<string> {
+    if (!autonomy || !calendarTransport) return 'unavailable'
+    const remote = calendarTransport
+    let mutationDispatched = false
+    const bridge = new CalendarBridge(autonomy, {
+      create(event, signal) { mutationDispatched = true; return remote.create(event, signal) },
+      get(id, signal) { return remote.get(id, signal) },
+      delete(id, signal) { mutationDispatched = true; return remote.delete(id, signal) },
+    })
+    const startedAt = Date.now()
+    const executionId = crypto.randomUUID()
+    const auditBase = { schemaVersion: 1 as const, operationId: admission.operationId, executionId,
+      principalId: link.principalId, sessionId: admission.sessionId, originChannel: 'whatsapp' as const,
+      policyVersion: ctx.access.state.config?.policyVersion }
+    try {
+      return await ctx.control.runDirect(admission, async signal => {
+        ctx.access.recordAudit({ ...auditBase, eventType: 'dispatch_started', reasonCode: 'CALENDAR_SYNC',
+          outcome: 'requested', createdAt: startedAt })
+        let outcome: 'completed' | 'failed' | 'unknown' = 'failed'
+        try {
+          if (signal.aborted) throw new Error('SESSION_STOPPED')
+          const result = await bridge.reconcile(link, signal)
+          if (signal.aborted) {
+            if (mutationDispatched) ctx.control.markDirectUnconfirmed(admission)
+            outcome = mutationDispatched ? 'unknown' : 'failed'
+            throw new Error('SESSION_STOPPED')
+          }
+          ctx.control.assertCurrent(admission)
+          outcome = 'completed'
+          return result
+        } catch (error) {
+          if (signal.aborted && mutationDispatched) { ctx.control.markDirectUnconfirmed(admission); outcome = 'unknown' }
+          throw error
+        } finally {
+          try { ctx.access.recordAudit({ ...auditBase, eventType: 'execution_settled',
+            reasonCode: outcome === 'completed' ? 'CALENDAR_SYNC_COMPLETED'
+              : outcome === 'unknown' ? 'CALENDAR_SYNC_UNCONFIRMED' : 'CALENDAR_SYNC_FAILED',
+            outcome, createdAt: Date.now(), durationMs: Date.now() - startedAt }) }
+          catch { /* Durable audit health is tracked by the access service. */ }
+        }
+      })
+    } catch (error) {
+      if (error instanceof Error && ['SESSION_STOPPED', 'SESSION_STOPPING', 'SESSION_UNCONFIRMED'].includes(error.message)) throw error
+      // Keep the durable link for retry; never claim the Google mutation succeeded.
+      const current = autonomy.calendarLink(link.principalId, link.senderKey, link.reminderId)
+      if (current && current.state !== 'deleted') autonomy.settleCalendarLink(current, current.state, Date.now() + 60_000)
+      return 'pending'
+    }
+  }
+
+  async function syncCalendarInBackground(): Promise<void> {
+    if (!autonomy || !calendarTransport) return
+    for (const link of autonomy.dueCalendarLinks(Date.now(), 5)) {
+      const jid = resolveSender(link.principalId, link.senderKey, true)
+      if (!jid) { autonomy.settleCalendarLink(link, link.state, Date.now() + 60_000); continue }
+      try {
+        const sessionId = sessionFor(jid)
+        ctx.access.bindRootSession(sessionId, link.principalId, 'whatsapp')
+        const admission = ctx.control.admit({ principalId: link.principalId, originChannel: 'whatsapp' }, sessionId)
+        const result = await syncCalendarLink(link, admission)
+        if (result === 'updated' || result === 'deleted') armAutonomy()
+      } catch {
+        const current = autonomy.calendarLink(link.principalId, link.senderKey, link.reminderId)
+        if (current && current.state !== 'deleted') autonomy.settleCalendarLink(current, current.state, Date.now() + 60_000)
+      }
+    }
+  }
+
   function armAutonomy(): void {
     if (autonomyTimer) clearTimeout(autonomyTimer)
     autonomyTimer = undefined
     if (disposed || !connected || !autonomy) return
-    const nextAt = Math.min(autonomy.nextReminderAt() ?? Infinity, autonomy.nextProactiveAt() ?? Infinity)
+    const nextAt = Math.min(autonomy.nextReminderAt() ?? Infinity, autonomy.nextProactiveAt() ?? Infinity,
+      calendarTransport ? autonomy.nextCalendarAt() ?? Infinity : Infinity)
     if (!Number.isFinite(nextAt)) return
     autonomyTimer = setTimeout(() => { autonomyTimer = undefined; void pumpAutonomy() },
       Math.max(1, Math.min(2_147_483_647, nextAt - Date.now())))
@@ -433,6 +554,7 @@ export function apply(ctx: Context) {
   async function pumpAutonomy(): Promise<void> {
     if (autonomyPump || !autonomy || !connected || disposed) return
     autonomyPump = (async () => {
+      await syncCalendarInBackground()
       for (let count = 0; count < 10 && connected && !disposed; count++) {
         const row = autonomy?.takeDueReminder()
         if (!row) break
@@ -598,11 +720,20 @@ export function apply(ctx: Context) {
       ctx.control.assertCurrent(admission)
       return sendWA(jid, { text: value }, { quoted: msg })
     }
+    if (principal.chatOnly && !['.help', '.status', '.new', '.refresh'].includes(command)) {
+      await reply('Akun pengguna biasa hanya bisa mengobrol. Perintah pengelolaan dan tool tersedia untuk owner.')
+      return true
+    }
 
     if (command === '.help') {
+      if (principal.chatOnly) {
+        await reply('.new  mulai obrolan baru\n.status  lihat status sesi\n.stop  hentikan pekerjaanmu yang sedang berjalan')
+        return true
+      }
       await reply([
         '.new  mulai percakapan baru',
         '.status  lihat status sesi dan model',
+        '.settings  lihat dan ubah pengaturan WhatsApp owner',
         '.emotion auto atau 0 sampai 5  atur tingkat emosi',
         '.pc  cek kondisi singkat laptop',
         '.download <tautan HTTPS>  unduh file publik dan kirim ke WhatsApp',
@@ -610,72 +741,35 @@ export function apply(ctx: Context) {
         '.inisiatif on|off|status  chat spontan dari ELARA untuk owner',
         '.remind <10m/1h/HH:MM> <pesan>  pasang pengingat',
         '.remind list  lihat pengingat; .remind cancel <id>  batalkan',
+        '.voice <pesan>  minta jawaban voice note (owner)',
+        '.hermes run <tugas>  uji tugas proyek contoh (owner)',
+        '.hermes status|review|stop  pantau, tinjau, atau hentikan tugas',
+        '.calendar status  lihat koneksi Google Calendar',
         '.dashboard  alamat dashboard lokal',
         '.remember <teks>  simpan ingatan',
         '.memories  lihat ingatanmu',
         '.searchmemory <kata>  cari ingatan',
         '.forget <id>  hapus ingatanmu',
-        '.add <nomor>  tambah akses izin pengguna baru',
-        '.del <nomor>  hapus akses pengguna',
-        '.allowlist  lihat daftar pengguna yang diizinkan',
+        '.allowlist  lihat nomor yang benar-benar dikonfigurasi',
       ].join('\n'))
       return true
     }
-    if (command === '.add') {
-      if (!principal.trustedWhatsAppOwner?.aliases.includes(jid)) {
-        await reply('hanya owner yang bisa menambah izin akses')
+    if (command === '.add' || command === '.del' || command === '.allowlist') {
+      if (!isOwnerAlias(principal, jid)) {
+        await reply('Pengelolaan akses hanya untuk nomor owner terverifikasi.')
         return true
       }
-      const targetNumber = argument.replace(/[^0-9]/g, '')
-      if (!targetNumber) {
-        await reply('format nomor tidak valid, gunakan contoh: .add 6281234567890')
+      if (command !== '.allowlist') {
+        await reply('Penambahan dan pencabutan akses lewat WhatsApp belum aktif. Nomor harus diatur pada konfigurasi akses lokal; perintah ini tidak mengubah izin.')
         return true
       }
-      const allowlistPath = path.resolve(rootDir, '.runtime', 'whatsapp-allowlist.json')
-      let list: string[] = []
-      try {
-        if (fs.existsSync(allowlistPath)) {
-          list = JSON.parse(fs.readFileSync(allowlistPath, 'utf8'))
-        }
-      } catch {}
-      if (!list.includes(targetNumber)) {
-        list.push(targetNumber)
-        fs.writeFileSync(allowlistPath, JSON.stringify(list, null, 2), 'utf8')
-      }
-      await reply(`berhasil menambahkan izin akses untuk ${targetNumber}`)
-      return true
-    }
-    if (command === '.del') {
-      if (!principal.trustedWhatsAppOwner?.aliases.includes(jid)) {
-        await reply('hanya owner yang bisa menghapus izin akses')
-        return true
-      }
-      const targetNumber = argument.replace(/[^0-9]/g, '')
-      if (!targetNumber) {
-        await reply('format nomor tidak valid, gunakan contoh: .del 6281234567890')
-        return true
-      }
-      const allowlistPath = path.resolve(rootDir, '.runtime', 'whatsapp-allowlist.json')
-      let list: string[] = []
-      try {
-        if (fs.existsSync(allowlistPath)) {
-          list = JSON.parse(fs.readFileSync(allowlistPath, 'utf8'))
-        }
-      } catch {}
-      list = list.filter(num => num !== targetNumber)
-      fs.writeFileSync(allowlistPath, JSON.stringify(list, null, 2), 'utf8')
-      await reply(`berhasil menghapus izin akses untuk ${targetNumber}`)
-      return true
-    }
-    if (command === '.allowlist') {
-      const allowlistPath = path.resolve(rootDir, '.runtime', 'whatsapp-allowlist.json')
-      let list: string[] = []
-      try {
-        if (fs.existsSync(allowlistPath)) {
-          list = JSON.parse(fs.readFileSync(allowlistPath, 'utf8'))
-        }
-      } catch {}
-      await reply(list.length ? `Daftar nomor terdaftar WhatsApp:\n${list.map(u => `- ${u}`).join('\n')}` : 'belum ada daftar izin tambahan')
+      const entries = ctx.access.state.config?.principals
+        .filter(item => item.enabled)
+        .flatMap(item => (item.channelAliases.whatsapp ?? []).map(alias => `${alias} — ${
+          item.trustedWhatsAppOwner?.aliases.includes(alias) ? 'owner' : item.chatOnly ? 'pengguna biasa (chat saja)' : 'akses lokal'
+        }`)) ?? []
+      await reply(entries.length ? `Nomor WhatsApp yang benar-benar diberi akses:\n${entries.join('\n')}`
+        : 'Belum ada nomor WhatsApp aktif di konfigurasi akses.')
       return true
     }
     if (command === '.new' || command === '.refresh') {
@@ -687,7 +781,9 @@ export function apply(ctx: Context) {
       const handle = agentHandles.get(oldSession)
       if (handle) await handle.dispose()
       agentHandles.delete(oldSession)
-      const newSessionId = `whatsapp:${userKey(jid)}:${crypto.randomUUID()}`
+      const newSessionId = principal.chatOnly
+        ? `whatsapp:${userKey(jid)}:${principal.id}:${crypto.randomUUID()}`
+        : `whatsapp:${userKey(jid)}:${crypto.randomUUID()}`
       ctx.access.bindRootSession(newSessionId, principal.id, 'whatsapp')
       sessionState[userKey(jid)] = newSessionId
       saveSessionState()
@@ -731,8 +827,7 @@ export function apply(ctx: Context) {
         await reply('Pilih auto atau angka 0 sampai 5')
         return true
       }
-      emotionPreferences[userKey(jid)] = requested
-      saveEmotionPreferences()
+      settings.setEmotion(userKey(jid), requested)
       const selected = requested === 'auto' ? 'auto' : `${requested}  ${EMOTION_LEVEL_LABELS[requested]}`
       await reply(`Tingkat emosi diatur ke ${selected}`)
       return true
@@ -769,7 +864,11 @@ export function apply(ctx: Context) {
       if (cancel) {
         const removed = autonomy.cancelReminder(principal.id, userKey(jid), Number(cancel[1]))
         armAutonomy()
-        await reply(removed ? 'pengingat dibatalkan' : 'pengingat itu tidak ditemukan atau sudah selesai')
+        if (removed && isOwnerAlias(principal, jid) && calendarTransport) {
+          const link = autonomy.calendarLink(principal.id, userKey(jid), Number(cancel[1]))
+          if (link) await syncCalendarLink(link, admission)
+        }
+        await reply(removed ? 'pengingat dibatalkan. perubahan kalender akan disinkronkan.' : 'pengingat itu tidak ditemukan atau sudah selesai')
         return true
       }
       const draft = commandReminder(argument)
@@ -779,8 +878,60 @@ export function apply(ctx: Context) {
       }
       ctx.control.assertCurrent(admission)
       const id = autonomy.addReminder(principal.id, userKey(jid), String(msg.key?.id), draft)
+      let calendarStatus = ''
+      if (isOwnerAlias(principal, jid) && calendarTransport) {
+        autonomy.linkCalendar(principal.id, userKey(jid), id,
+          calendarEventId(principal.id, userKey(jid), String(msg.key?.id)))
+        const link = autonomy.calendarLink(principal.id, userKey(jid), id)!
+        const result = await syncCalendarLink(link, admission)
+        calendarStatus = result === 'created' || result === 'updated' || result === 'unchanged'
+          ? '\nAcara Google Calendar sudah tercatat.' : '\nGoogle Calendar masih menunggu sinkronisasi.'
+      }
       armAutonomy()
-      await reply(`oke, kuingetin ${describeDue(draft.dueAt)}. ID: ${id}`)
+      await reply(`oke, kuingetin ${describeDue(draft.dueAt)}. ID: ${id}${calendarStatus}`)
+      return true
+    }
+    if (command === '.calendar') {
+      await reply(isOwnerAlias(principal, jid)
+        ? calendarTransport ? 'Konfigurasi Google Calendar tersedia. Acara ELARA diperiksa berkala; perubahan dapat muncul dalam sekitar 5 menit. Jika token kedaluwarsa atau dicabut, sinkronisasi akan tertunda.'
+          : 'Google Calendar belum terhubung. Jalankan npm run calendar:connect di laptop lalu mulai ulang DSH.'
+        : 'Status Google Calendar hanya tersedia untuk owner terverifikasi.')
+      return true
+    }
+    if (command === '.voice') {
+      if (!isOwnerAlias(principal, jid)) { await reply('balasan voice note hanya untuk nomor owner terverifikasi.'); return true }
+      if (!argument) { await reply('Tulis .voice lalu pesanmu, misalnya .voice ceritain kabarmu hari ini'); return true }
+      if (!outboundVoice) { await reply('Balasan suara belum dikonfigurasi di laptop ini.'); return true }
+      return false
+    }
+    if (command === '.hermes') {
+      if (!isOwnerAlias(principal, jid)) { await reply('Mode proyek Hermes hanya untuk nomor owner terverifikasi.'); return true }
+      if (!projectJobs) { await reply('Mode proyek Hermes belum aktif. Prototipe saat ini hanya diuji pada proyek contoh.'); return true }
+      if (argument.toLowerCase() === 'status') {
+        const job = projectJobs.current(principal.id, jid)
+        await reply(job ? `Hermes (${projectName}): ${job.state}${job.unconfirmed ? ' (proses turunan belum terverifikasi)' : ''}. ID: ${job.id}`
+          : 'Belum ada tugas Hermes untuk nomor ini.')
+        return true
+      }
+      if (argument.toLowerCase() === 'review') {
+        const job = projectJobs.current(principal.id, jid)
+        await reply(job ? job.state === 'completed' || job.state === 'failed'
+          ? `Laporan Hermes (${job.state}; belum diverifikasi ELARA):\n${job.output?.slice(0, 3000) || 'Hermes tidak memberi laporan teks.'}`
+          : `Tugas Hermes masih ${job.state}. Cek lagi lewat .hermes status.`
+          : 'Belum ada laporan Hermes untuk nomor ini.')
+        return true
+      }
+      if (argument.toLowerCase() === 'stop') {
+        const stop = projectJobs.stop(principal.id, jid)
+        await reply(stop ? `Stop Hermes diminta. ID: ${stop.id}. Status: ${stop.outcome}.` : 'Belum ada tugas Hermes untuk nomor ini.')
+        return true
+      }
+      const task = argument.match(/^run\s+([\s\S]+)$/iu)?.[1]?.trim()
+      if (!task) { await reply('Gunakan .hermes run <tugas>, .hermes status, .hermes review, atau .hermes stop.'); return true }
+      const instruction = `Kerjakan tugas berikut pada workspace proyek contoh yang sudah dikonfigurasi di profil Hermes. Jangan commit, push, deploy, atau mengakses proyek lain. Jalankan tes yang relevan dan akhiri dengan daftar file berubah, hasil tes, serta batasan. Tugas: ${task}`
+      const job = projectJobs.start(principal.id, jid, instruction)
+      projectAdmissions.set(job.id, admission)
+      await reply(`Tugas Hermes diterima untuk ${projectName}. ID: ${job.id}. Cek .hermes status untuk progres.`)
       return true
     }
     return false
@@ -800,6 +951,16 @@ export function apply(ctx: Context) {
       ctx.control.assertCurrent(admission)
       if (await handleCommand(jid, principal, msg, text, admission)) return
       ctx.control.assertCurrent(admission)
+      const voiceRequested = voiceReplyRequested(text)
+      if (voiceRequested && !isOwnerAlias(principal, jid)) {
+        await sendWA(jid, { text: 'Balasan voice note hanya tersedia untuk nomor owner terverifikasi.' }, { quoted: msg })
+        return
+      }
+      if (voiceRequested && !outboundVoice) {
+        await sendWA(jid, { text: 'Balasan suara belum dikonfigurasi di laptop ini.' }, { quoted: msg })
+        return
+      }
+      const modelText = voiceRequested ? voicePrompt(text) : text
       if (isDownloadRequest(text)) {
         const hostDeviceId = ctx.access.state.config?.authorities.hostDeviceId
         if (!isOwnerAlias(principal, jid) || !hostDeviceId || !principal.allowedDeviceIds.includes(hostDeviceId)) {
@@ -856,7 +1017,7 @@ export function apply(ctx: Context) {
         })
         return
       }
-      if (isOwnerAlias(principal, jid) && !hasMedia && !text.startsWith('.')) {
+      if (!voiceRequested && isOwnerAlias(principal, jid) && !hasMedia && !text.startsWith('.')) {
         const reminder = inferReminder(text)
         if (reminder) {
           if (!autonomy) {
@@ -865,9 +1026,19 @@ export function apply(ctx: Context) {
           }
           try {
             const id = autonomy.addReminder(principal.id, userKey(jid), String(msg.key?.id), reminder)
+            let calendarStatus = ''
+            if (calendarTransport) {
+              autonomy.linkCalendar(principal.id, userKey(jid), id,
+                calendarEventId(principal.id, userKey(jid), String(msg.key?.id)))
+              const link = autonomy.calendarLink(principal.id, userKey(jid), id)!
+              const result = await syncCalendarLink(link, admission)
+              calendarStatus = result === 'created' || result === 'updated' || result === 'unchanged'
+                ? ' Acara Google Calendar juga sudah tercatat.'
+                : ' Acara Google Calendar masih menunggu sinkronisasi.'
+            } else calendarStatus = ' Google Calendar belum terhubung; pengingat lokal tetap aktif.'
             armAutonomy()
             ctx.control.assertCurrent(admission)
-            await sendWA(jid, { text: `oke, aku catat. kuingetin ${describeDue(reminder.dueAt)}. kalau batal, kirim .remind cancel ${id}` }, { quoted: msg })
+            await sendWA(jid, { text: `oke, aku catat. kuingetin ${describeDue(reminder.dueAt)}. kalau batal, kirim .remind cancel ${id}.${calendarStatus}` }, { quoted: msg })
           } catch (error) {
             if (error instanceof Error && error.message === 'REMINDER_LIMIT') {
               await sendWA(jid, { text: 'pengingat aktifmu sudah penuh. batalkan dulu lewat .remind list ya' }, { quoted: msg })
@@ -893,7 +1064,7 @@ export function apply(ctx: Context) {
       const agent = await acquireAgent(sessionId)
       ctx.control.assertCurrent(admission)
       const before = agent.session.deriveMessages()
-      const emotion = assessEmotion(text, emotionModeFor(jid))
+      const emotion = assessEmotion(modelText, emotionModeFor(jid))
       agent.inject(createUserMessage({
         source: { kind: 'plugin', plugin: 'elara-emotion', form: 'instructions' },
         content: [{ type: 'text', text: emotionStyleContext(emotion) }],
@@ -901,6 +1072,10 @@ export function apply(ctx: Context) {
       agent.inject(createUserMessage({
         source: { kind: 'plugin', plugin: 'elara-whatsapp-format', form: 'instructions' },
         content: [{ type: 'text', text: 'Balasan ini akan dikirim sebagai teks WhatsApp. Jika perlu penekanan, gunakan *tebal* (satu bintang) atau _miring_. Gunakan tiga backtick di kedua sisi blok perintah atau kode. Jangan pakai **tebal**, judul dengan #, tabel Markdown, atau HTML. Obrolan santai tetap teks biasa. Jangan mengubah isi literal perintah, path, URL, atau kutipan demi format.' }],
+      }))
+      if (voiceRequested) agent.inject(createUserMessage({
+        source: { kind: 'plugin', plugin: 'elara-whatsapp-voice', form: 'instructions' },
+        content: [{ type: 'text', text: 'Pengguna meminta balasan voice note. Tulis jawaban langsung dalam bahasa Indonesia, 1 sampai 4 kalimat dan maksimal 600 karakter. Gunakan kata yang enak didengar. Jangan gunakan Markdown, emoji, tabel, blok kode, atau URL panjang. Adaptor akan mengubah teks ini menjadi audio dan mengirimkannya. Jangan mengklaim audio telah terkirim.' }],
       }))
       if (principal.trustedWhatsAppOwner?.aliases.includes(jid) && !ownerIdentityInjected.has(agent)) {
         agent.inject(createUserMessage({
@@ -927,7 +1102,7 @@ export function apply(ctx: Context) {
           ].filter(Boolean).join('\n\n') }],
         }))
       }
-      const memories = text ? ctx.memory.search(owner, text, 5) : []
+      const memories = modelText ? ctx.memory.search(owner, modelText, 5) : []
       if (memories.length) {
         agent.inject(createUserMessage({
           source: { kind: 'plugin', plugin: 'elara-memory', form: 'recall' },
@@ -938,7 +1113,7 @@ export function apply(ctx: Context) {
         }))
         for (const memory of memories) ctx.memory.updateLastUsed(owner, memory.id)
       }
-      const content = await ctx.control.runDirect(admission, signal => buildContent(msg, text, signal))
+      const content = await ctx.control.runDirect(admission, signal => buildContent(msg, modelText, signal))
       ctx.control.assertCurrent(admission)
       await ctx.agents.withInitiator(agent, async () => {
         ctx.control.assertCurrent(admission)
@@ -990,6 +1165,51 @@ export function apply(ctx: Context) {
       }
       if (!response) throw new Error('Model selesai tanpa menghasilkan balasan teks')
 
+      if (voiceRequested) {
+        const voice = outboundVoice!
+        const executionId = crypto.randomUUID()
+        const startedAt = Date.now()
+        const auditBase = { schemaVersion: 1 as const, operationId: admission.operationId, executionId,
+          principalId: principal.id, sessionId, originChannel: 'whatsapp' as const,
+          policyVersion: ctx.access.state.config?.policyVersion }
+        let sendAttempted = false
+        try {
+          await ctx.control.runDirect(admission, async signal => {
+            ctx.access.recordAudit({ ...auditBase, eventType: 'dispatch_started', reasonCode: 'VOICE_REPLY',
+              outcome: 'requested', createdAt: startedAt })
+            let outcome: 'completed' | 'failed' | 'cancelled' | 'unknown' = 'failed'
+            try {
+              const audio = assertOggOpus(await voice.synthesize(response, signal))
+              if (signal.aborted) throw new Error('SESSION_STOPPED')
+              ctx.control.assertCurrent(admission)
+              sendAttempted = true
+              const sent = await sendWA(jid, { audio, mimetype: 'audio/ogg; codecs=opus', ptt: true }, { quoted: msg })
+              if (signal.aborted) { ctx.control.markDirectUnconfirmed(admission); throw new Error('SESSION_STOPPED') }
+              if (!sent?.key?.id) throw new Error('VOICE_SEND_UNCONFIRMED')
+              outcome = 'completed'
+            } catch (error) {
+              outcome = error instanceof Error && error.message.includes('PROCESS_TERMINATION_UNCONFIRMED')
+                ? 'unknown' : signal.aborted ? sendAttempted ? 'unknown' : 'cancelled'
+                : sendAttempted ? 'unknown' : 'failed'
+              throw error
+            } finally {
+              try { ctx.access.recordAudit({ ...auditBase, eventType: 'execution_settled',
+                reasonCode: outcome === 'completed' ? 'VOICE_REPLY_COMPLETED'
+                  : outcome === 'cancelled' ? 'VOICE_REPLY_CANCELLED'
+                    : outcome === 'unknown' ? 'VOICE_REPLY_UNCONFIRMED' : 'VOICE_REPLY_FAILED',
+                outcome, createdAt: Date.now(), durationMs: Date.now() - startedAt }) }
+              catch { /* Audit health is reported by access service. */ }
+            }
+          })
+        } catch (error) {
+          if (error instanceof Error && ['SESSION_STOPPED', 'SESSION_STOPPING', 'SESSION_UNCONFIRMED'].includes(error.message)) throw error
+          if (sendAttempted) throw new Error('VOICE_SEND_UNCONFIRMED')
+          ctx.control.assertCurrent(admission)
+          await sendWA(jid, { text: `Suara belum bisa kukirim, jadi kutulis jawabannya: ${response}` }, { quoted: msg })
+        }
+        return
+      }
+
       const bubbles = splitIntoBubbles(response)
       for (let index = 0; index < bubbles.length; index++) {
         ctx.control.assertCurrent(admission)
@@ -997,7 +1217,7 @@ export function apply(ctx: Context) {
           firstBubble: index === 0,
           emotionLevel: emotion.effectiveLevel,
           category: emotion.category,
-          speed: typingSpeed,
+          speed: settings.typing(userKey(jid)),
         })
         if (process.env.ELARA_MOCK_WA === '1') {
           ctx.emit('elara/test-whatsapp-typing-delay' as any, {
@@ -1148,11 +1368,139 @@ export function apply(ctx: Context) {
           void sendWA(jid, { text: 'Balas langsung pesan persetujuannya dengan perintah itu, atau beri reaksi setuju / tolak pada pesan tersebut.' }).catch(() => undefined)
           continue
         }
-        const message = messageText(msg.message, extractMessageContent).trim()
+        let message = messageText(msg.message, extractMessageContent).trim()
+        const legacyMembers = message.match(/^\.(add|del|allowlist)(?:\s+(\S+))?$/iu)
+        if (legacyMembers) message = legacyMembers[1].toLowerCase() === 'allowlist'
+          ? '.settings users list'
+          : `.settings users ${legacyMembers[1].toLowerCase() === 'add' ? 'add' : 'remove'} ${legacyMembers[2] || ''}`
         if (autonomy && (message && !message.startsWith('.') || mediaInfo(msg.message, extractMessageContent))) {
           try {
             if (autonomy.acknowledgeReminders(principal.id, userKey(jid))) armAutonomy()
           } catch { console.warn('[ELARA] Reminder acknowledgment could not be saved') }
+        }
+        const settingsCommand = message.match(/^\.settings(?:\s+(.*))?$/iu)
+        if (settingsCommand) {
+          if (!isOwnerAlias(principal, jid)) {
+            void sendWA(jid, { text: 'Pengaturan bot hanya tersedia untuk nomor owner terverifikasi.' }).catch(() => undefined)
+            continue
+          }
+          const parts = (settingsCommand[1] || '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+          const [setting, value] = parts
+          if (setting === 'users' || setting === 'role') {
+            const action = value || 'list'
+            if (action === 'list' && parts.length <= 2) {
+              const users = ctx.access.state.config?.principals.filter(item => item.enabled)
+                .flatMap(item => (item.channelAliases.whatsapp ?? []).map(alias =>
+                  `${alias} — ${item.trustedWhatsAppOwner?.aliases.includes(alias) ? 'owner'
+                    : item.chatOnly ? 'pengguna biasa (chat saja)' : 'akses lokal'}`)) ?? []
+              void sendWA(jid, { text: users.length ? `*Akses WhatsApp aktif*\n${users.join('\n')}`
+                : 'Belum ada nomor WhatsApp aktif.' }).catch(() => undefined)
+              continue
+            }
+            const number = parts[2]
+            if (parts.length !== 3 || !['add', 'remove'].includes(action)
+              || !/^\+?[1-9][0-9]{7,14}$/.test(number || '')) {
+              void sendWA(jid, { text: 'Gunakan .settings users list, .settings users add 6281234567890, atau .settings users remove 6281234567890.' }).catch(() => undefined)
+              continue
+            }
+            const alias = `${number!.replace(/^\+/, '')}@s.whatsapp.net`
+            try {
+              const ownerSession = sessionFor(jid)
+              ctx.access.bindRootSession(ownerSession, principal.id, 'whatsapp')
+              ctx.control.admit({ principalId: principal.id, originChannel: 'whatsapp' }, ownerSession)
+              const owner = { principalId: principal.id, originChannel: 'whatsapp' as const, senderAlias: jid }
+              if (action === 'add') {
+                ctx.access.addWhatsAppMember(owner, ownerSession, alias)
+                void sendWA(jid, { text: `Nomor ${number} sekarang pengguna biasa: bisa mengobrol, tanpa izin tool.` }).catch(() => undefined)
+              } else {
+                const member = ctx.access.managedWhatsAppMember(alias)
+                if (!member) throw new Error('MEMBER_NOT_MANAGED')
+                let stop: { outcome: string } | undefined
+                if (member.enabled) {
+                  const targetSession = sessionFor(alias)
+                  ctx.access.bindRootSession(targetSession, member.id, 'whatsapp')
+                  stop = ctx.control.requestStop({ principalId: member.id, originChannel: 'whatsapp' }, targetSession)
+                }
+                ctx.access.revokeWhatsAppMember(owner, ownerSession, alias)
+                delete sessionState[userKey(alias)]
+                try { saveSessionState() } catch { console.warn('[ELARA] Revoked member session state cleanup was unavailable') }
+                void sendWA(jid, { text: `Akses ${number} dicabut. Pekerjaan lamanya: ${stop?.outcome ?? 'permintaan stop sebelumnya'}; penghentian belum dikonfirmasi jika statusnya stopping atau unconfirmed.` }).catch(() => undefined)
+              }
+            } catch (error) {
+              const code = error instanceof Error ? error.message : ''
+              const explanation = code === 'MEMBER_ALREADY_CONFIGURED' ? 'Nomor itu sudah punya akses.'
+                : code === 'MEMBER_NOT_MANAGED' ? 'Nomor itu bukan pengguna yang ditambahkan lewat WhatsApp. Akses lokal tetap diatur di laptop.'
+                  : code === 'AUDIT_UNAVAILABLE' ? 'Perubahan akses ditolak karena audit sedang bermasalah.'
+                    : code === 'MEMBER_REVOKE_UNCONFIRMED' ? 'Akses nomor diblokir sampai DSH dimulai ulang, tetapi pencabutan permanen belum bisa dipastikan. Periksa penyimpanan kontrol.'
+                    : 'Perubahan akses belum berhasil. Cek format nomor dan kondisi layanan.'
+              void sendWA(jid, { text: explanation }).catch(() => undefined)
+            }
+            continue
+          }
+          if (!setting || setting === 'status' || setting === 'help') {
+            let auto = 'tidak tersedia'
+            try {
+              const sessionId = sessionFor(jid)
+              ctx.access.bindRootSession(sessionId, principal.id, 'whatsapp')
+              auto = ctx.access.getAutoMode({ principalId: principal.id,
+                originChannel: 'whatsapp', senderAlias: jid }, sessionId) ? 'aktif' : 'mati'
+            } catch { /* Show the other settings even when access state is unavailable. */ }
+            const emotion = emotionModeFor(jid)
+            let initiative = 'tidak tersedia'
+            try {
+              if (autonomy) initiative = autonomy.proactive(principal.id, userKey(jid))?.enabled ? 'aktif' : 'mati'
+            } catch { /* A broken reminder database does not hide other settings. */ }
+            const lines = [
+              '*Pengaturan ELARA*',
+              `Emosi: ${emotion === 'auto' ? 'auto' : `${emotion} (${EMOTION_LEVEL_LABELS[emotion]})`}`,
+              `Mengetik: ${settings.typing(userKey(jid))}`,
+              `Chat spontan: ${initiative}`,
+              `Mode otomatis: ${auto} (berakhir saat DSH dimulai ulang)`,
+              `Balasan suara: ${outboundVoice ? 'tersedia lewat .voice' : 'belum tersedia'}`,
+              `Google Calendar: ${calendarTransport ? 'terhubung' : 'belum terhubung'}`,
+              `Hermes: ${projectJobs ? 'uji proyek contoh' : 'belum aktif'}`,
+              '',
+              '*Ubah langsung di sini:*',
+              '.settings emotion auto|0|1|2|3|4|5',
+              '.settings typing instant|fast|natural|slow',
+              '.settings initiative on|off',
+              '.settings auto on|off',
+              '.settings users list|add <nomor>|remove <nomor>',
+              '',
+              'Pengingat: .remind. .add/.del/.allowlist tetap bisa dipakai.',
+              'Koneksi, kredensial, perangkat, dan kebijakan keamanan diatur di laptop.',
+            ]
+            void sendWA(jid, { text: lines.join('\n') }).catch(() => undefined)
+            continue
+          }
+          if (parts.length === 2 && (setting === 'emotion' || setting === 'typing')) {
+            const emotion = setting === 'emotion' ? parseEmotionMode(value) : undefined
+            const typing = setting === 'typing' ? validTyping(value) : undefined
+            if (emotion === undefined && !typing) {
+              void sendWA(jid, { text: setting === 'emotion'
+                ? 'Pilih emosi auto atau angka 0 sampai 5.'
+                : 'Pilih kecepatan mengetik instant, fast, natural, atau slow.' }).catch(() => undefined)
+              continue
+            }
+            try {
+              if (emotion !== undefined) settings.setEmotion(userKey(jid), emotion)
+              if (typing) settings.setTyping(userKey(jid), typing)
+              void sendWA(jid, { text: `Pengaturan ${setting} sekarang ${value}.` }).catch(() => undefined)
+            } catch {
+              void sendWA(jid, { text: 'Pengaturan belum berhasil disimpan. Coba lagi setelah penyimpanan pulih.' }).catch(() => undefined)
+            }
+            continue
+          }
+          if (parts.length <= 2 && (setting === 'initiative' || setting === 'inisiatif')
+            && (!value || ['on', 'off', 'status'].includes(value))) {
+            message = `.inisiatif ${value || 'status'}`
+          } else if (parts.length <= 2 && setting === 'auto'
+            && (!value || ['on', 'off', 'status'].includes(value))) {
+            message = `.auto ${value || 'status'}`
+          } else {
+            void sendWA(jid, { text: 'Pengaturan itu belum tersedia. Ketik .settings untuk melihat pilihan.' }).catch(() => undefined)
+            continue
+          }
         }
         const proactiveCommand = message.match(/^\.inisiatif(?:\s+(on|off|status))?$/iu)
         if (proactiveCommand) {
@@ -1205,11 +1553,22 @@ export function apply(ctx: Context) {
             const sessionId = sessionFor(jid)
             ctx.access.bindRootSession(sessionId, principal.id, 'whatsapp')
             const stop = ctx.control.requestStop({ principalId: principal.id, originChannel: 'whatsapp' }, sessionId)
+            let projectStop
+            try { projectStop = isOwnerAlias(principal, jid) ? projectJobs?.stop(principal.id, jid) : undefined }
+            catch { /* The DSH stop acknowledgment still goes out. */ }
             void socket?.sendPresenceUpdate('paused', jid).catch(() => undefined)
             void sendWA(jid, { text: stop.outcome === 'idle'
-              ? `Tidak ada pekerjaan aktif. ID stop: ${stop.id}`
-              : `Stop diminta. ID: ${stop.id}. Status: ${stop.outcome}.` }).catch(() => undefined)
+              ? `Tidak ada pekerjaan DSH aktif. ID stop: ${stop.id}${projectStop ? `. Hermes: ${projectStop.outcome} (ID ${projectStop.id})` : ''}`
+              : `Stop diminta. ID: ${stop.id}. Status: ${stop.outcome}.${projectStop ? ` Hermes: ${projectStop.outcome} (ID ${projectStop.id}).` : ''}` }).catch(() => undefined)
           } catch { void sendWA(jid, { text: 'Stop tidak tersedia untuk sesi ini.' }).catch(() => undefined) }
+          continue
+        }
+        if (message.toLowerCase() === '.hermes stop') {
+          try {
+            const stop = isOwnerAlias(principal, jid) ? projectJobs?.stop(principal.id, jid) : undefined
+            void sendWA(jid, { text: stop ? `Stop Hermes diminta. ID: ${stop.id}. Status: ${stop.outcome}.`
+              : 'Tidak ada tugas Hermes aktif untuk nomor ini.' }).catch(() => undefined)
+          } catch { void sendWA(jid, { text: 'Stop Hermes belum bisa dipastikan. Cek .hermes status.' }).catch(() => undefined) }
           continue
         }
         try {
@@ -1248,6 +1607,7 @@ export function apply(ctx: Context) {
     await Promise.allSettled([...startupTasks])
     await Promise.allSettled(queues.values())
     if (autonomyPump) await autonomyPump.catch(() => undefined)
+    if (projectJobs) await projectJobs.dispose()
     for (const handle of agentHandles.values()) await handle.dispose().catch(() => undefined)
     for (const entry of approvalMessages.values()) clearTimeout(entry.timer)
     approvalMessages.clear()

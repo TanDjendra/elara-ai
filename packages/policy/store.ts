@@ -55,6 +55,15 @@ export class AccessStore {
       CREATE INDEX IF NOT EXISTS idx_audit_scope ON audit_events(principal_id, origin_channel, session_id, id DESC);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_terminal ON audit_events(execution_id)
         WHERE event_type = 'execution_settled' AND execution_id IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS whatsapp_members (
+        member_id TEXT PRIMARY KEY,
+        alias TEXT NOT NULL,
+        added_at INTEGER NOT NULL,
+        revoked_at INTEGER,
+        schema_version INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_member_active_alias
+        ON whatsapp_members(alias) WHERE revoked_at IS NULL;
       UPDATE audit_events SET outcome = 'unknown', reason_code = 'PROCESS_RESTARTED'
         WHERE outcome IN ('requested', 'stopping') AND (
           (event_type = 'dispatch_started' AND NOT EXISTS (
@@ -68,6 +77,39 @@ export class AccessStore {
               AND terminal.event_type = 'approval_resolved'))
         );
     `)
+  }
+
+  listWhatsAppMembers(): Array<{ id: string; alias: string }> {
+    const rows = this.db.prepare(`SELECT member_id, alias FROM whatsapp_members
+      WHERE revoked_at IS NULL ORDER BY added_at, member_id`).all() as Array<{ member_id: string; alias: string }>
+    return rows.map(row => ({ id: row.member_id, alias: row.alias }))
+  }
+
+  addWhatsAppMember(id: string, alias: string, audit: AuditRecord): void {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(`INSERT INTO whatsapp_members (member_id, alias, added_at, schema_version) VALUES (?, ?, ?, 1)`)
+        .run(id, alias, Date.now())
+      this.recordAudit(audit)
+      this.db.exec('COMMIT')
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  revokeWhatsAppMember(id: string, audit: AuditRecord): void {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const changed = this.db.prepare(`UPDATE whatsapp_members SET revoked_at = ?
+        WHERE member_id = ? AND revoked_at IS NULL`).run(Date.now(), id)
+      if (changed.changes !== 1) throw new Error('MEMBER_NOT_FOUND')
+      this.recordAudit(audit)
+      this.db.exec('COMMIT')
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  revokeWhatsAppMemberWithoutAudit(id: string): void {
+    const changed = this.db.prepare(`UPDATE whatsapp_members SET revoked_at = ?
+      WHERE member_id = ? AND revoked_at IS NULL`).run(Date.now(), id)
+    if (changed.changes !== 1) throw new Error('MEMBER_NOT_FOUND')
   }
 
   bindingFor(sessionId: string): SessionBinding | undefined {

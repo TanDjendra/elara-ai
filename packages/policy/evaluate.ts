@@ -163,6 +163,7 @@ export function evaluatePolicy(
   const principal = config.principals.find(candidate => candidate.id === context.principalId)
   if (!principal?.enabled) return decision('deny', 'PRINCIPAL_DISABLED_OR_UNKNOWN')
   if (bindingPrincipalId !== principal.id) return decision('deny', 'SESSION_OWNER_UNTRUSTED')
+  if (principal.chatOnly) return decision('deny', 'CHAT_ONLY_ROLE')
   if (context.denialReasonCode) return decision('deny', context.denialReasonCode)
   if (capability.executionLocation === 'host') {
     if (context.targetDeviceId !== config.authorities.hostDeviceId

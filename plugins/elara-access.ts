@@ -1,4 +1,5 @@
 import * as path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
@@ -45,6 +46,9 @@ export interface AutoModeContext {
 export interface AccessService {
   readonly state: AccessConfigState
   principalForAlias(channel: OriginChannel, alias: string): Principal | undefined
+  managedWhatsAppMember(alias: string): Principal | undefined
+  addWhatsAppMember(owner: AutoModeContext, ownerSessionId: string, alias: string): Principal
+  revokeWhatsAppMember(owner: AutoModeContext, ownerSessionId: string, alias: string): void
   dashboardPrincipal(): Principal | undefined
   bindRootSession(sessionId: string, principalId: string, originChannel: OriginChannel): SessionBinding
   bindingForSession(sessionId: string): SessionBinding | undefined
@@ -153,6 +157,28 @@ export function apply(ctx: Context) {
   function targetFor(binding: SessionBinding | undefined): string {
     if (!binding) return 'unbound'
     return state.config?.authorities.channelDefaultDeviceIds[binding.originChannel] || 'unconfigured'
+  }
+  const managedMembers = new Map<string, Principal>()
+  if (state.config) for (const member of store.listWhatsAppMembers()) {
+    if (!/^[1-9][0-9]{7,14}@s\.whatsapp\.net$/.test(member.alias)
+      || !/^wa-[0-9a-f-]{36}$/.test(member.id)
+      || aliasIndex.has(`whatsapp\u0000${member.alias}`)) continue
+    const principal: Principal = { id: member.id, role: 'user', enabled: true, chatOnly: true,
+      channelAliases: { whatsapp: [member.alias] }, allowedDeviceIds: [] }
+    state.config.principals.push(principal)
+    managedMembers.set(member.alias, principal)
+    aliasIndex.set(`whatsapp\u0000${member.alias}`, principal)
+  }
+
+  function assertWhatsAppOwner(owner: AutoModeContext, sessionId: string): void {
+    const principal = aliasIndex.get(`whatsapp\u0000${owner.senderAlias}`)
+    const binding = store.bindingFor(sessionId)
+    if (owner.originChannel !== 'whatsapp' || !principal?.enabled
+      || principal.id !== owner.principalId
+      || !principal.trustedWhatsAppOwner?.aliases.includes(owner.senderAlias)
+      || binding?.principalId !== owner.principalId || binding.originChannel !== 'whatsapp') {
+      throw new Error('OWNER_UNAUTHORIZED')
+    }
   }
 
   function authorizeAutoMode(context: AutoModeContext, sessionId: string): Principal {
@@ -298,6 +324,47 @@ export function apply(ctx: Context) {
     principalForAlias(channel, alias) {
       const principal = aliasIndex.get(`${channel}\u0000${alias}`)
       return principal?.enabled ? principal : undefined
+    },
+    managedWhatsAppMember(alias) { return managedMembers.get(alias) },
+    addWhatsAppMember(owner, ownerSessionId, alias) {
+      assertWhatsAppOwner(owner, ownerSessionId)
+      if (!/^[1-9][0-9]{7,14}@s\.whatsapp\.net$/.test(alias)) throw new Error('MEMBER_ALIAS_INVALID')
+      if (aliasIndex.has(`whatsapp\u0000${alias}`)) throw new Error('MEMBER_ALREADY_CONFIGURED')
+      if (!state.config || auditDegraded) throw new Error('AUDIT_UNAVAILABLE')
+      const principal: Principal = { id: `wa-${randomUUID()}`, role: 'user', enabled: true,
+        chatOnly: true, channelAliases: { whatsapp: [alias] }, allowedDeviceIds: [] }
+      try {
+        store.addWhatsAppMember(principal.id, alias, { schemaVersion: 1, operationId: auditId(),
+          executionId: principal.id, principalId: owner.principalId, sessionId: ownerSessionId,
+          originChannel: 'whatsapp', policyVersion: state.config.policyVersion,
+          eventType: 'membership_changed', reasonCode: 'MEMBER_ADDED', outcome: 'completed', createdAt: Date.now() })
+      } catch { auditDegraded = true; throw new Error('AUDIT_UNAVAILABLE') }
+      state.config.principals.push(principal)
+      managedMembers.set(alias, principal)
+      aliasIndex.set(`whatsapp\u0000${alias}`, principal)
+      return principal
+    },
+    revokeWhatsAppMember(owner, ownerSessionId, alias) {
+      assertWhatsAppOwner(owner, ownerSessionId)
+      const principal = managedMembers.get(alias)
+      if (!principal) throw new Error('MEMBER_NOT_MANAGED')
+      let durable = false
+      try {
+        if (auditDegraded) throw new Error('AUDIT_UNAVAILABLE')
+        store.revokeWhatsAppMember(principal.id, { schemaVersion: 1, operationId: auditId(),
+          executionId: principal.id, principalId: owner.principalId, sessionId: ownerSessionId,
+          originChannel: 'whatsapp', policyVersion: state.config?.policyVersion,
+          eventType: 'membership_changed', reasonCode: 'MEMBER_REVOKED', outcome: 'completed', createdAt: Date.now() })
+        durable = true
+      } catch {
+        auditDegraded = true
+        console.error('[ELARA-AUDIT] membership revocation audit unavailable')
+        try { store.revokeWhatsAppMemberWithoutAudit(principal.id); durable = true } catch { /* Fence ingress anyway. */ }
+      }
+      principal.enabled = false
+      aliasIndex.delete(`whatsapp\u0000${alias}`)
+      if (durable) managedMembers.delete(alias)
+      if (!durable) throw new Error('MEMBER_REVOKE_UNCONFIRMED')
     },
     dashboardPrincipal() {
       const id = state.config?.authorities.dashboardPrincipalId

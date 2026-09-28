@@ -24,6 +24,8 @@ export interface Principal {
   enabled: boolean
   channelAliases: Partial<Record<OriginChannel, string[]>>
   allowedDeviceIds: string[]
+  /** Runtime-managed WhatsApp members can converse but cannot dispatch tools. */
+  chatOnly?: boolean
   trustedWhatsAppOwner?: { name: string; aliases: string[] }
 }
 

@@ -8,6 +8,7 @@ import * as http from 'node:http'
 import * as net from 'node:net'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { execFileSync, spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { verifyThenCleanup } from '../tests/fixtures/runtime/cleanup.mjs'
@@ -262,8 +263,13 @@ before(async () => {
     'plugins/elara-core.ts', 'plugins/elara-memory.ts', 'plugins/windows-tools.ts',
     'plugins/windows-tools-local.ts', 'plugins/dashboard-api.ts', 'plugins/companion-api.ts',
     'channels/whatsapp-baileys/plugin.ts', 'channels/whatsapp-baileys/emotion.ts',
+    'channels/whatsapp-baileys/settings.ts',
     'channels/whatsapp-baileys/approval-buttons.ts',
     'channels/whatsapp-baileys/autonomy.ts',
+    'channels/whatsapp-baileys/google-calendar.ts',
+    'channels/whatsapp-baileys/calendar-auth.ts',
+    'channels/whatsapp-baileys/outbound-voice.ts',
+    'channels/whatsapp-baileys/hermes-project.ts',
     'channels/whatsapp-baileys/outbound-screenshot.ts',
     'channels/whatsapp-baileys/document-media.ts',
     'channels/whatsapp-baileys/ocr-local.ts',
@@ -1215,6 +1221,143 @@ describe('offline DSH-loader composition', () => {
     }
   })
 
+  test('owner WhatsApp settings change live preferences and keep other senders isolated', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const other = 'user-a@s.whatsapp.net'
+    const beforeOther = sent.length
+    emitMessage(other, 'fixture-settings-non-owner', '.settings')
+    await waitFor(() => sent.slice(beforeOther).find(item => item.remoteJid === other
+      && item.text?.includes('hanya tersedia untuk nomor owner')), 'non-owner settings denial')
+
+    const beforeMenu = sent.length
+    emitMessage(jid, 'fixture-settings-menu', '.settings')
+    const menu = await waitFor(() => sent.slice(beforeMenu).find(item => item.remoteJid === jid
+      && item.text?.includes('*Pengaturan ELARA*')), 'owner settings menu')
+    assert.match(menu.text, /Emosi:|Mengetik:|Chat spontan:|Mode otomatis:/)
+    assert.doesNotMatch(menu.text, /fixture-dashboard-token|\.runtime|accessToken|client_secret/)
+
+    const beforeTyping = sent.length
+    emitMessage(jid, 'fixture-settings-typing', '.settings typing instant')
+    await waitFor(() => sent.slice(beforeTyping).find(item => item.remoteJid === jid
+      && item.text?.includes('typing sekarang instant')), 'live typing preference')
+    const key = crypto.createHash('sha256').update(jid).digest('hex').slice(0, 24)
+    const preferences = JSON.parse(fs.readFileSync(path.join(fixtureRoot, '.runtime', 'whatsapp-preferences.json'), 'utf8'))
+    assert.equal(preferences.version, 2)
+    assert.equal(preferences.users[key].typing, 'instant')
+    assert.equal(preferences.users[crypto.createHash('sha256').update(other).digest('hex').slice(0, 24)]?.typing,
+      undefined)
+    const beforeReply = typing.length
+    emitMessage(jid, 'fixture-settings-typing-proof', 'fixture settings typing proof')
+    await waitFor(() => typing.slice(beforeReply).find(item => item.jid === jid
+      && item.bubble.includes('fixture:fixture settings typing proof')), 'instant typing reply')
+    assert.equal(typing.slice(beforeReply).find(item => item.jid === jid
+      && item.bubble.includes('fixture:fixture settings typing proof')).milliseconds, 0)
+
+    const beforeEmotion = sent.length
+    emitMessage(jid, 'fixture-settings-emotion', '.settings emotion 3')
+    await waitFor(() => sent.slice(beforeEmotion).find(item => item.remoteJid === jid
+      && item.text?.includes('emotion sekarang 3')), 'live emotion preference')
+    const beforeInitiative = sent.length
+    emitMessage(jid, 'fixture-settings-initiative-off', '.settings initiative off')
+    await waitFor(() => sent.slice(beforeInitiative).find(item => item.remoteJid === jid
+      && item.text?.includes('chat spontan mati')), 'settings initiative alias')
+    const beforeInitiativeOn = sent.length
+    emitMessage(jid, 'fixture-settings-initiative-on', '.settings initiative on')
+    await waitFor(() => sent.slice(beforeInitiativeOn).find(item => item.remoteJid === jid
+      && item.text?.includes('chat spontan aktif')), 'settings initiative restored')
+    const beforeInvalid = sent.length
+    emitMessage(jid, 'fixture-settings-invalid', '.settings auto definitely')
+    await waitFor(() => sent.slice(beforeInvalid).find(item => item.remoteJid === jid
+      && item.text?.includes('belum tersedia')), 'invalid settings denial')
+    emitMessage(jid, 'fixture-settings-reset-typing', '.settings typing natural')
+    emitMessage(jid, 'fixture-settings-reset-emotion', '.settings emotion auto')
+    await waitFor(() => {
+      const stored = JSON.parse(fs.readFileSync(path.join(fixtureRoot, '.runtime', 'whatsapp-preferences.json'), 'utf8'))
+      return stored.users[key]?.typing === 'natural' && stored.users[key]?.emotion === 'auto'
+    }, 'restored settings defaults')
+  })
+
+  test('owner adds a chat-only member, then revokes it while model work is pending', async () => {
+    const owner = 'user-c@s.whatsapp.net'
+    const number = '6281234567890'
+    const memberJid = `${number}@s.whatsapp.net`
+    const beforeUnauthorized = sent.length
+    emitMessage('user-a@s.whatsapp.net', 'fixture-member-non-owner', `.settings users add ${number}`)
+    await waitFor(() => sent.slice(beforeUnauthorized).find(item => item.remoteJid === 'user-a@s.whatsapp.net'
+      && item.text?.includes('hanya tersedia untuk nomor owner')), 'non-owner member mutation denied')
+    assert.equal(ctx.access.principalForAlias('whatsapp', memberJid), undefined)
+
+    const beforeAdd = sent.length
+    emitMessage(owner, 'fixture-member-add', `.settings users add ${number}`)
+    await waitFor(() => sent.slice(beforeAdd).find(item => item.remoteJid === owner
+      && item.text?.includes('sekarang pengguna biasa')), 'member add acknowledgment')
+    const member = ctx.access.principalForAlias('whatsapp', memberJid)
+    assert.equal(member?.role, 'user')
+    assert.equal(member?.chatOnly, true)
+    assert.deepEqual(member?.allowedDeviceIds, [])
+    const beforeDuplicate = sent.length
+    emitMessage(owner, 'fixture-member-duplicate', `.settings users add ${number}`)
+    await waitFor(() => sent.slice(beforeDuplicate).find(item => item.remoteJid === owner
+      && item.text?.includes('sudah punya akses')), 'duplicate member denied')
+    const beforeCommand = sent.length
+    emitMessage(memberJid, 'fixture-member-command', '.pc')
+    await waitFor(() => sent.slice(beforeCommand).find(item => item.remoteJid === memberJid
+      && item.text?.includes('hanya bisa mengobrol')), 'member command denied')
+    const bindingId = `whatsapp:${crypto.createHash('sha256').update(memberJid).digest('hex').slice(0, 24)}:${member.id}:root`
+    const decision = ctx.access.decideDirect({ principalId: member.id, sessionId: bindingId,
+      originChannel: 'whatsapp', targetDeviceId: 'fixture-companion', source: 'fixture:member',
+      capabilityId: 'system.status' })
+    assert.equal(decision.reasonCode, 'CHAT_ONLY_ROLE')
+
+    const blockedText = 'fixture chat-only blocked model'
+    const block = blockFixtureResponse(blockedText)
+    const beforeRevocation = sent.length
+    try {
+      emitMessage(memberJid, 'fixture-member-blocked', blockedText)
+      await block.started
+      emitMessage(memberJid, 'fixture-member-queued', 'fixture member queued')
+      emitMessage(owner, 'fixture-member-remove', `.settings users remove ${number}`)
+      await waitFor(() => sent.slice(beforeRevocation).find(item => item.remoteJid === owner
+        && item.text?.includes('Akses 6281234567890 dicabut')), 'member revoke acknowledgment')
+      assert.equal(ctx.access.principalForAlias('whatsapp', memberJid), undefined)
+      block.release()
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(sent.slice(beforeRevocation).some(item => item.remoteJid === memberJid
+        && item.text?.includes(`fixture:${blockedText}`)), false)
+      assert.equal(requestRows().some(row => row.text === 'fixture member queued'), false)
+      const beforeDenied = sent.length
+      emitMessage(memberJid, 'fixture-member-revoked-ingress', 'hello after revoke')
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(sent.slice(beforeDenied).some(item => item.remoteJid === memberJid), false)
+      assert.equal(ctx.access.state.config.principals.find(item => item.id === member.id)?.enabled, false)
+      const beforeReadd = sent.length
+      emitMessage(owner, 'fixture-member-readd', `.settings users add ${number}`)
+      await waitFor(() => sent.slice(beforeReadd).find(item => item.remoteJid === owner
+        && item.text?.includes('sekarang pengguna biasa')), 'member readd acknowledgment')
+      const replacement = ctx.access.principalForAlias('whatsapp', memberJid)
+      assert.ok(replacement)
+      assert.notEqual(replacement.id, member.id)
+      const beforeReplacementStatus = sent.length
+      emitMessage(memberJid, 'fixture-member-replacement-status', '.status')
+      await waitFor(() => sent.slice(beforeReplacementStatus).find(item => item.remoteJid === memberJid
+        && item.text?.includes('Status:')), 'replacement member status')
+      const newBindingId = `whatsapp:${crypto.createHash('sha256').update(memberJid).digest('hex').slice(0, 24)}:${replacement.id}:root`
+      assert.equal(ctx.access.bindingForSession(newBindingId)?.principalId, replacement.id)
+      assert.equal(ctx.access.bindingForSession(bindingId)?.principalId, member.id)
+      const beforeSecondRemove = sent.length
+      emitMessage(owner, 'fixture-member-remove-again', `.settings users remove ${number}`)
+      await waitFor(() => sent.slice(beforeSecondRemove).find(item => item.remoteJid === owner
+        && item.text?.includes('Akses 6281234567890 dicabut')), 'replacement revoke')
+      const db = new DatabaseSync(path.join(fixtureRoot, 'control', 'elara-control.db'))
+      try {
+        assert.equal(db.prepare('SELECT COUNT(*) AS n FROM whatsapp_members WHERE alias = ? AND revoked_at IS NULL')
+          .get(memberJid).n, 0)
+        assert.equal(db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE event_type = 'membership_changed' AND execution_id = ?")
+          .get(member.id).n, 2)
+      } finally { db.close() }
+    } finally { block.release() }
+  })
+
   test('owner plans become durable reminders and proactive turns start without user input', async () => {
     const jid = 'user-c@s.whatsapp.net'
     const db = new DatabaseSync(path.join(fixtureRoot, '.runtime', 'whatsapp-autonomy.db'))
@@ -1330,6 +1473,76 @@ describe('offline DSH-loader composition', () => {
         && item.text?.includes('chat spontan mati')), 'proactive off')
       assert.equal(db.prepare('SELECT enabled FROM whatsapp_proactive WHERE principal_id = ?').get('fixture-user-c').enabled, 0)
     } finally { db.close() }
+  })
+
+  test('owner calendar events sync both ways through synthetic Google transport', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const events = new Map()
+    const remote = {
+      async create(event) { events.set(event.id, event); return event },
+      async get(id) { return events.get(id) },
+      async delete(id) { events.delete(id) },
+    }
+    ctx.emit('elara/test-calendar-handler', remote)
+    const db = new DatabaseSync(path.join(fixtureRoot, '.runtime', 'whatsapp-autonomy.db'))
+    try {
+      const before = sent.length
+      emitMessage(jid, 'fixture-calendar-plan', 'lusa jam 10 rapat CALENDAR_SECRET_MARKER')
+      await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('Acara Google Calendar juga sudah tercatat')), 'calendar create acknowledgment')
+      const row = db.prepare(`SELECT r.id, r.text, c.event_id AS eventId FROM whatsapp_reminders r
+        JOIN whatsapp_calendar_links c ON c.reminder_id = r.id WHERE r.source_id = ?`).get('fixture-calendar-plan')
+      assert.ok(row)
+      assert.equal(events.has(row.eventId), true)
+      const changedAt = Date.now() + 4 * 3_600_000
+      events.set(row.eventId, { id: row.eventId, summary: 'jadwal digeser',
+        start: { dateTime: new Date(changedAt).toISOString() } })
+      db.prepare('UPDATE whatsapp_calendar_links SET next_check_at = 0 WHERE reminder_id = ?').run(row.id)
+      ctx.emit('elara/test-autonomy-tick', {})
+      await waitFor(() => db.prepare('SELECT text FROM whatsapp_reminders WHERE id = ?').get(row.id)?.text === 'jadwal digeser',
+        'Google edit reflected locally')
+      const cancelBefore = sent.length
+      emitMessage(jid, 'fixture-calendar-cancel', `.remind cancel ${row.id}`)
+      await waitFor(() => sent.slice(cancelBefore).find(item => item.remoteJid === jid
+        && item.text?.includes('pengingat dibatalkan')), 'calendar cancellation acknowledgment')
+      assert.equal(events.has(row.eventId), false)
+      const sessionId = ctx.access.bindingForSession(`whatsapp:${jid}`)?.sessionId
+      const audit = ctx.control.listAudit({ principalId: 'fixture-user-c', originChannel: 'whatsapp' }, sessionId)
+      assert.ok(audit.some(item => item.reasonCode === 'CALENDAR_SYNC_COMPLETED'))
+      assert.doesNotMatch(JSON.stringify(audit), /CALENDAR_SECRET_MARKER/)
+      const otherBefore = sent.length
+      emitMessage('user-a@s.whatsapp.net', 'fixture-calendar-wrong-owner', '.calendar status')
+      await waitFor(() => sent.slice(otherBefore).find(item => item.remoteJid === 'user-a@s.whatsapp.net'
+        && item.text?.includes('hanya tersedia untuk owner')), 'calendar owner restriction')
+    } finally { ctx.emit('elara/test-calendar-handler', undefined); db.close() }
+  })
+
+  test('calendar dispatch is denied when durable audit append fails', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    let creates = 0
+    ctx.emit('elara/test-calendar-handler', {
+      async create(event) { creates++; return event },
+      async get() { return undefined },
+      async delete() {},
+    })
+    const original = ctx.access.recordAudit
+    const db = new DatabaseSync(path.join(fixtureRoot, '.runtime', 'whatsapp-autonomy.db'))
+    try {
+      ctx.access.recordAudit = () => { throw new Error('SYNTHETIC_AUDIT_FAILURE') }
+      const before = sent.length
+      emitMessage(jid, 'fixture-calendar-audit-denial', 'lusa jam 11 rapat sintetis')
+      await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('masih menunggu sinkronisasi')), 'calendar audit denial reply')
+      assert.equal(creates, 0)
+      const row = db.prepare(`SELECT c.state, c.reminder_id AS reminderId FROM whatsapp_calendar_links c
+        JOIN whatsapp_reminders r ON r.id = c.reminder_id WHERE r.source_id = ?`).get('fixture-calendar-audit-denial')
+      assert.equal(row.state, 'pending')
+      db.prepare("UPDATE whatsapp_calendar_links SET state = 'deleted' WHERE reminder_id = ?").run(row.reminderId)
+    } finally {
+      ctx.access.recordAudit = original
+      ctx.emit('elara/test-calendar-handler', undefined)
+      db.close()
+    }
   })
 
   test('a fresh session screenshot is delivered as a WhatsApp image, with an honest missing-file result', async () => {
@@ -1618,6 +1831,207 @@ describe('offline DSH-loader composition', () => {
     }
   })
 
+  test('owner explicitly requests an Opus voice reply while other senders cannot', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const audio = Buffer.alloc(40)
+    audio.write('OggS', 0, 'ascii')
+    audio.write('OpusHead', 28, 'ascii')
+    const spoken = []
+    ctx.emit('elara/test-whatsapp-voice-handler', {
+      async synthesize(text) { spoken.push(text); return audio },
+    })
+    try {
+      const before = sent.length
+      emitMessage(jid, 'fixture-voice-outbound', '.voice ceritain kabarmu')
+      const note = await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && Buffer.isBuffer(item.audio) && item.ptt === true), 'owner voice reply')
+      assert.deepEqual(note.audio, audio)
+      assert.equal(note.mimetype, 'audio/ogg; codecs=opus')
+      assert.ok(spoken.some(text => text.includes('ceritain kabarmu')))
+      assert.ok(requestRows().some(row => row.text.includes('ceritain kabarmu') && !row.text.includes('.voice ceritain kabarmu')))
+      assert.equal(sent.slice(before).some(item => item.remoteJid === jid && item.text?.includes('fixture:ceritain kabarmu')), false)
+      const senderKey = crypto.createHash('sha256').update(jid).digest('hex').slice(0, 24)
+      const sessionState = JSON.parse(fs.readFileSync(path.join(fixtureRoot, '.runtime', 'whatsapp-sessions.json'), 'utf8'))
+      const sessionId = sessionState[senderKey] || `whatsapp:${jid}`
+      const audit = await waitFor(() => {
+        const rows = ctx.control.listAudit({ principalId: 'fixture-user-c', originChannel: 'whatsapp' },
+          sessionId)
+        return rows.some(row => row.reasonCode === 'VOICE_REPLY_COMPLETED') ? rows : undefined
+      }, 'voice audit settlement')
+      assert.doesNotMatch(JSON.stringify(audit), /ceritain kabarmu/)
+      const otherBefore = sent.length
+      emitMessage('user-a@s.whatsapp.net', 'fixture-voice-other', '.voice hai')
+      await waitFor(() => sent.slice(otherBefore).some(item => item.remoteJid === 'user-a@s.whatsapp.net'
+        && item.text?.includes('hanya untuk nomor owner')), 'non-owner voice denial')
+      assert.equal(sent.slice(otherBefore).some(item => item.remoteJid === 'user-a@s.whatsapp.net' && item.audio), false)
+    } finally { ctx.emit('elara/test-whatsapp-voice-handler', undefined) }
+  })
+
+  test('voice dispatch fails closed when durable audit cannot record it', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const originalAudit = ctx.access.recordAudit
+    let syntheses = 0
+    const before = sent.length
+    ctx.emit('elara/test-whatsapp-voice-handler', {
+      async synthesize() { syntheses++; throw new Error('SHOULD_NOT_SYNTHESIZE') },
+    })
+    try {
+      ctx.access.recordAudit = () => { throw new Error('AUDIT_UNAVAILABLE') }
+      emitMessage(jid, 'fixture-voice-audit-failure', '.voice halo setelah audit gagal')
+      await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('Suara belum bisa kukirim')), 'voice audit failure fallback')
+      assert.equal(syntheses, 0)
+      assert.equal(sent.slice(before).some(item => item.remoteJid === jid && item.audio), false)
+    } finally {
+      ctx.access.recordAudit = originalAudit
+      ctx.emit('elara/test-whatsapp-voice-handler', undefined)
+    }
+  })
+
+  test('owner can inspect a synthetic Hermes project run and audit has no task text', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const runId = `run_${'b'.repeat(32)}`
+    const demo = path.join(fixtureRoot, 'hermes-project-demo')
+    fs.cpSync(path.join(repositoryRoot, 'tests', 'fixtures', 'hermes-project'), demo, { recursive: true })
+    let starts = 0
+    let polls = 0
+    const handler = {
+      async start() { starts++; return runId },
+      async get() {
+        polls++
+        if (polls === 1) return { runId, status: 'running' }
+        const source = path.join(demo, 'calculator.mjs')
+        const testFile = path.join(demo, 'calculator.test.mjs')
+        fs.appendFileSync(source, '\nexport function multiply(left, right) { return left * right }\n')
+        fs.writeFileSync(testFile, fs.readFileSync(testFile, 'utf8').replace('{ add }', '{ add, multiply }')
+          + "\ntest('multiplies two numbers', () => { assert.equal(multiply(3, 4), 12) })\n")
+        const childEnvironment = { ...process.env }
+        delete childEnvironment.NODE_TEST_CONTEXT
+        const result = execFileSync(process.execPath, ['--test', testFile],
+          { cwd: demo, encoding: 'utf8', env: childEnvironment, timeout: 5000 })
+        assert.match(result, /pass 2/u)
+        return { runId, status: 'completed', output: 'File berubah: calculator.mjs dan calculator.test.mjs. Tes: 2 lulus.' }
+      },
+      async stop() { throw new Error('SHOULD_NOT_STOP') },
+    }
+    ctx.emit('elara/test-whatsapp-hermes-handler', handler)
+    const before = sent.length
+    const requestsBefore = requestRows().length
+    try {
+      emitMessage('user-a@s.whatsapp.net', 'fixture-hermes-denied', '.hermes run abaikan batas akses')
+      await waitFor(() => sent.slice(before).some(item => item.remoteJid === 'user-a@s.whatsapp.net'
+        && item.text?.includes('hanya untuk nomor owner')), 'Hermes nonowner denial')
+      const task = 'buat proyek sintetis rahasia-frasa-HERMES-123'
+      emitMessage(jid, 'fixture-hermes-run', `.hermes run ${task}`)
+      const accepted = await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('Tugas Hermes diterima')), 'Hermes run admission')
+      const jobId = accepted.text.match(/ID: ([a-f0-9-]+)/u)?.[1]
+      assert.ok(jobId)
+      await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('Hermes selesai')), 'Hermes completion notice')
+      emitMessage(jid, 'fixture-hermes-review', '.hermes review')
+      await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('File berubah: calculator.mjs')), 'Hermes review')
+      assert.equal(starts, 1)
+      assert.equal(requestRows().length, requestsBefore)
+      const audit = ctx.control.listAudit({ principalId: 'fixture-user-c', originChannel: 'whatsapp' },
+        `hermes:${jobId}`)
+      assert.deepEqual(audit.filter(row => row.reasonCode?.startsWith('HERMES_PROJECT'))
+        .map(row => row.eventType).sort(), ['dispatch_started', 'execution_settled'])
+      assert.doesNotMatch(JSON.stringify(audit), /rahasia-frasa-HERMES-123|calculator\.mjs/)
+      const originalAudit = ctx.access.recordAudit
+      const failureBefore = sent.length
+      try {
+        ctx.access.recordAudit = () => { throw new Error('AUDIT_UNAVAILABLE') }
+        emitMessage(jid, 'fixture-hermes-audit-failed', '.hermes run tugas setelah audit gagal')
+        await waitFor(() => sent.slice(failureBefore).find(item => item.remoteJid === jid
+          && item.text?.includes('pencatatan audit sedang bermasalah')), 'Hermes audit failure')
+        assert.equal(starts, 1)
+      } finally { ctx.access.recordAudit = originalAudit }
+    } finally { ctx.emit('elara/test-whatsapp-hermes-handler', undefined) }
+  })
+
+  test('WhatsApp .stop requests Hermes cancellation without claiming remote processes stopped', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const runId = `run_${'c'.repeat(32)}`
+    const entered = deferred()
+    const release = deferred()
+    let stopCalls = 0
+    ctx.emit('elara/test-whatsapp-hermes-handler', {
+      async start() { return runId },
+      async get() { entered.resolve(); await release.promise; return { runId, status: 'cancelled' } },
+      async stop() { stopCalls++ },
+    })
+    const before = sent.length
+    try {
+      emitMessage(jid, 'fixture-hermes-pending', '.hermes run ubah berkas contoh lalu tes')
+      await entered.promise
+      emitMessage(jid, 'fixture-hermes-stop', '.stop')
+      const ack = await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('Hermes: stopping')), 'Hermes stop acknowledgment')
+      const stopId = ack.text.match(/Hermes: stopping \(ID ([a-f0-9-]+)\)/u)?.[1]
+      assert.ok(stopId)
+      assert.equal(stopCalls, 1)
+      assert.equal(ctx.control.getStopStatus({ principalId: 'fixture-user-c', originChannel: 'whatsapp' },
+        stopId).outcome, 'stopping')
+      release.resolve()
+      await waitFor(() => ctx.control.getStopStatus({ principalId: 'fixture-user-c', originChannel: 'whatsapp' },
+        stopId).outcome === 'unconfirmed', 'Hermes remote stop uncertainty')
+      emitMessage(jid, 'fixture-hermes-status-after-stop', '.hermes status')
+      await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('proses turunan belum terverifikasi')), 'Hermes honest status')
+      emitMessage('user-b@s.whatsapp.net', 'fixture-other-after-hermes-stop', 'sesi lain tetap jalan')
+      await waitFor(() => sent.slice(before).find(item => item.remoteJid === 'user-b@s.whatsapp.net'
+        && item.text?.includes('fixture:sesi lain tetap jalan')), 'unaffected session after Hermes stop')
+    } finally {
+      release.resolve()
+      ctx.emit('elara/test-whatsapp-hermes-handler', undefined)
+    }
+  })
+
+  test('a fixture-owned process settles a Hermes stop only after its exit is verified', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const runId = `run_${'d'.repeat(32)}`
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+      { shell: false, windowsHide: true, stdio: 'ignore' })
+    const pid = child.pid
+    assert.ok(pid)
+    const closed = new Promise(resolve => child.once('close', resolve))
+    const entered = deferred()
+    let stopped = false
+    ctx.emit('elara/test-whatsapp-hermes-handler', {
+      async start() { return runId },
+      async get() { entered.resolve(); return { runId, status: stopped ? 'cancelled' : 'running' } },
+      async stop() { child.kill(); await closed; stopped = true },
+      async verifyStopped() {
+        if (!stopped) return false
+        try { process.kill(pid, 0); return false }
+        catch { return true }
+      },
+    })
+    const before = sent.length
+    try {
+      emitMessage(jid, 'fixture-hermes-owned-run', '.hermes run proses contoh yang bisa dihentikan')
+      await entered.promise
+      emitMessage(jid, 'fixture-hermes-owned-stop', '.hermes stop')
+      const ack = await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('Stop Hermes diminta')), 'owned Hermes stop acknowledgment')
+      const stopId = ack.text.match(/ID: ([a-f0-9-]+)/u)?.[1]
+      assert.ok(stopId)
+      await waitFor(() => ctx.control.getStopStatus({ principalId: 'fixture-user-c', originChannel: 'whatsapp' },
+        stopId).outcome === 'stopped', 'verified fixture stop')
+      assert.equal(stopped, true)
+      assert.throws(() => process.kill(pid, 0), /ESRCH|not found|no such process/i)
+      emitMessage(jid, 'fixture-hermes-owned-status', '.hermes status')
+      await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('Hermes (proyek contoh): cancelled')
+        && !item.text.includes('belum terverifikasi')), 'verified fixture status')
+    } finally {
+      child.kill()
+      ctx.emit('elara/test-whatsapp-hermes-handler', undefined)
+    }
+  })
+
   test('WhatsApp memory commands isolate principals and reset only the requesting session', async () => {
     const a = 'user-a@s.whatsapp.net'
     const b = 'user-b@s.whatsapp.net'
@@ -1873,5 +2287,69 @@ describe('offline DSH-loader composition', () => {
       await new Promise(resolve => setImmediate(resolve))
       assert.equal(requestRows().some(row => row.text === text), false)
     } finally { release(); off() }
+  })
+
+  test('stop waits for voice synthesis and prevents a stale audio send', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const resetBefore = sent.length
+    emitMessage(jid, 'fixture-voice-stop-reset', '.new')
+    await waitFor(() => sent.slice(resetBefore).some(item => item.remoteJid === jid
+      && item.text?.includes('konteks baru')), 'voice stop fresh session')
+    const entered = deferred()
+    const release = deferred()
+    const audio = Buffer.alloc(40)
+    audio.write('OggS', 0, 'ascii')
+    audio.write('OpusHead', 28, 'ascii')
+    ctx.emit('elara/test-whatsapp-voice-handler', {
+      async synthesize() { entered.resolve(); await release.promise; return audio },
+    })
+    const before = sent.length
+    try {
+      emitMessage(jid, 'fixture-voice-stopped-request', '.voice kabar terbaru')
+      await entered.promise
+      emitMessage(jid, 'fixture-voice-stop-command', '.stop')
+      const ack = await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('Stop diminta')), 'voice stop acknowledgment')
+      const id = ack.text.match(/ID: ([a-f0-9-]+)/)?.[1]
+      assert.ok(id)
+      const scope = { principalId: 'fixture-user-c', originChannel: 'whatsapp' }
+      assert.equal(ctx.control.getStopStatus(scope, id).outcome, 'stopping')
+      release.resolve()
+      await waitFor(() => ctx.control.getStopStatus(scope, id).outcome !== 'stopping', 'voice stop settlement')
+      assert.equal(ctx.control.getStopStatus(scope, id).outcome, 'stopped')
+      assert.equal(sent.slice(before).some(item => item.remoteJid === jid && item.audio), false)
+    } finally { release.resolve(); ctx.emit('elara/test-whatsapp-voice-handler', undefined) }
+  })
+
+  test('calendar creation in a direct operation keeps stop pending and suppresses the stale reply', async () => {
+    const jid = 'user-c@s.whatsapp.net'
+    const resetBefore = sent.length
+    emitMessage(jid, 'fixture-calendar-stop-reset', '.new')
+    await waitFor(() => sent.slice(resetBefore).some(item => item.remoteJid === jid
+      && item.text?.includes('konteks baru')), 'calendar stop fresh session')
+    const entered = deferred()
+    const release = deferred()
+    const remote = {
+      async create(event) { entered.resolve(); await release.promise; return event },
+      async get() { return undefined },
+      async delete() {},
+    }
+    ctx.emit('elara/test-calendar-handler', remote)
+    const before = sent.length
+    try {
+      emitMessage(jid, 'fixture-calendar-stopped-plan', 'lusa jam 9 rapat sintetis')
+      await entered.promise
+      emitMessage(jid, 'fixture-calendar-stop-command', '.stop')
+      const ack = await waitFor(() => sent.slice(before).find(item => item.remoteJid === jid
+        && item.text?.includes('Stop diminta')), 'calendar stop acknowledgment')
+      const id = ack.text.match(/ID: ([a-f0-9-]+)/)?.[1]
+      assert.ok(id)
+      const scope = { principalId: 'fixture-user-c', originChannel: 'whatsapp' }
+      assert.equal(ctx.control.getStopStatus(scope, id).outcome, 'stopping')
+      release.resolve()
+      await waitFor(() => ctx.control.getStopStatus(scope, id).outcome !== 'stopping', 'calendar stop settlement')
+      assert.equal(ctx.control.getStopStatus(scope, id).outcome, 'unconfirmed')
+      assert.equal(sent.slice(before).some(item => item.remoteJid === jid && item.text?.includes('kuingetin')), false)
+    } finally { release.resolve(); ctx.emit('elara/test-calendar-handler', undefined) }
   })
 })

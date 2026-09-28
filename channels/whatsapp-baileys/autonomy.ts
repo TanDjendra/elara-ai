@@ -28,6 +28,15 @@ export interface ReminderRow extends ReminderDraft {
   lastTone: string
 }
 
+export interface CalendarLink {
+  reminderId: number
+  principalId: string
+  senderKey: string
+  eventId: string
+  state: 'pending' | 'linked' | 'delete_pending' | 'deleted'
+  nextCheckAt: number
+}
+
 export const REMINDER_TONES = ['lembut', 'santai', 'penasaran', 'gemas', 'kesal ringan', 'pasrah lucu', 'tegas'] as const
 export type ReminderTone = typeof REMINDER_TONES[number]
 
@@ -169,6 +178,12 @@ export function commandReminder(argument: string, now = new Date()): ReminderDra
 export class AutonomyStore {
   readonly db: DatabaseSync
 
+  private transaction<T>(operation: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE')
+    try { const result = operation(); this.db.exec('COMMIT'); return result }
+    catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
   constructor(file: string) {
     fs.mkdirSync(path.dirname(file), { recursive: true })
     this.db = new DatabaseSync(file)
@@ -198,6 +213,16 @@ export class AutonomyStore {
         last_user_at INTEGER NOT NULL DEFAULT 0,
         last_kind TEXT NOT NULL DEFAULT ''
       );
+      CREATE TABLE IF NOT EXISTS whatsapp_calendar_links (
+        reminder_id INTEGER PRIMARY KEY,
+        principal_id TEXT NOT NULL,
+        sender_key TEXT NOT NULL,
+        event_id TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK(state IN ('pending','linked','delete_pending','deleted')),
+        next_check_at INTEGER NOT NULL,
+        FOREIGN KEY(reminder_id) REFERENCES whatsapp_reminders(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_whatsapp_calendar_due ON whatsapp_calendar_links(state, next_check_at);
     `)
     const columns = this.db.prepare('PRAGMA table_info(whatsapp_proactive)').all() as { name: string }[]
     if (!columns.some(column => column.name === 'last_kind')) {
@@ -251,8 +276,68 @@ export class AutonomyStore {
   }
 
   cancelReminder(principalId: string, senderKey: string, id: number): boolean {
-    return this.db.prepare("UPDATE whatsapp_reminders SET status = 'cancelled' WHERE id = ? AND principal_id = ? AND sender_key = ? AND status IN ('pending', 'sending', 'awaiting')")
-      .run(id, principalId, senderKey).changes > 0
+    return this.transaction(() => {
+      const changed = this.db.prepare("UPDATE whatsapp_reminders SET status = 'cancelled' WHERE id = ? AND principal_id = ? AND sender_key = ? AND status IN ('pending', 'sending', 'awaiting')")
+        .run(id, principalId, senderKey).changes > 0
+      if (changed) this.db.prepare("UPDATE whatsapp_calendar_links SET state = 'delete_pending', next_check_at = 0 WHERE reminder_id = ? AND principal_id = ? AND sender_key = ? AND state IN ('pending','linked')")
+        .run(id, principalId, senderKey)
+      return changed
+    })
+  }
+
+  linkCalendar(principalId: string, senderKey: string, reminderId: number, eventId: string): void {
+    const row = this.db.prepare('SELECT id FROM whatsapp_reminders WHERE id = ? AND principal_id = ? AND sender_key = ?')
+      .get(reminderId, principalId, senderKey)
+    if (!row || !/^[0-9a-v]{5,1024}$/.test(eventId)) throw new Error('CALENDAR_LINK_INVALID')
+    this.db.prepare("INSERT OR IGNORE INTO whatsapp_calendar_links (reminder_id,principal_id,sender_key,event_id,state,next_check_at) VALUES (?,?,?,?, 'pending',0)")
+      .run(reminderId, principalId, senderKey, eventId)
+  }
+
+  calendarLink(principalId: string, senderKey: string, reminderId: number): CalendarLink | undefined {
+    return this.db.prepare(`SELECT reminder_id AS reminderId, principal_id AS principalId,
+      sender_key AS senderKey, event_id AS eventId, state, next_check_at AS nextCheckAt
+      FROM whatsapp_calendar_links WHERE reminder_id = ? AND principal_id = ? AND sender_key = ?`)
+      .get(reminderId, principalId, senderKey) as unknown as CalendarLink | undefined
+  }
+
+  dueCalendarLinks(now = Date.now(), limit = 20): CalendarLink[] {
+    return this.db.prepare(`SELECT reminder_id AS reminderId, principal_id AS principalId,
+      sender_key AS senderKey, event_id AS eventId, state, next_check_at AS nextCheckAt
+      FROM whatsapp_calendar_links WHERE state != 'deleted' AND next_check_at <= ?
+      ORDER BY next_check_at, reminder_id LIMIT ?`).all(now, limit) as unknown as CalendarLink[]
+  }
+
+  nextCalendarAt(): number | undefined {
+    const row = this.db.prepare("SELECT MIN(next_check_at) AS at FROM whatsapp_calendar_links WHERE state != 'deleted'").get() as { at: number | null }
+    return row.at ?? undefined
+  }
+
+  calendarReminder(link: CalendarLink): (ReminderDraft & { status: string }) | undefined {
+    return this.db.prepare('SELECT due_at AS dueAt, text, status FROM whatsapp_reminders WHERE id = ? AND principal_id = ? AND sender_key = ?')
+      .get(link.reminderId, link.principalId, link.senderKey) as unknown as (ReminderDraft & { status: string }) | undefined
+  }
+
+  settleCalendarLink(link: CalendarLink, state: CalendarLink['state'], nextCheckAt: number): void {
+    this.db.prepare('UPDATE whatsapp_calendar_links SET state = ?, next_check_at = ? WHERE reminder_id = ? AND principal_id = ? AND sender_key = ? AND state = ?')
+      .run(state, nextCheckAt, link.reminderId, link.principalId, link.senderKey, link.state)
+  }
+
+  applyCalendarEvent(link: CalendarLink, event: { dueAt: number; text: string } | undefined, now = Date.now()): void {
+    this.transaction(() => {
+      if (!event) {
+        this.db.prepare("UPDATE whatsapp_reminders SET status = 'cancelled' WHERE id = ? AND principal_id = ? AND sender_key = ? AND status IN ('pending','sending','awaiting')")
+          .run(link.reminderId, link.principalId, link.senderKey)
+        this.settleCalendarLink(link, 'deleted', 0)
+        return
+      }
+      if (!Number.isSafeInteger(event.dueAt) || !event.text.trim()) return
+      this.db.prepare(`UPDATE whatsapp_reminders SET due_at = ?, scheduled_at = ?, text = ?,
+        status = ?, repeat_count = 0 WHERE id = ? AND principal_id = ? AND sender_key = ?
+        AND status IN ('pending','sending','awaiting','sent','acknowledged','calendar_paused')`)
+        .run(event.dueAt, event.dueAt, event.text.slice(0, 500),
+          event.dueAt <= now ? 'calendar_paused' : 'pending', link.reminderId, link.principalId, link.senderKey)
+      this.settleCalendarLink(link, 'linked', now + 5 * 60_000)
+    })
   }
 
   acknowledgeReminders(principalId: string, senderKey: string): number {

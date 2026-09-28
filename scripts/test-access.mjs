@@ -1,6 +1,7 @@
 import { afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import * as fs from 'node:fs'
+import * as crypto from 'node:crypto'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { loadAccessConfig, validateAccessConfig } from '../packages/policy/config.ts'
@@ -111,6 +112,34 @@ describe('access configuration', () => {
     assert.equal(corrupt.enabled, false)
     assert.doesNotMatch(corrupt.diagnostic, /\{broken/)
   })
+})
+
+test('managed WhatsApp membership persists and rolls back when audit cannot be recorded', () => {
+  const file = path.join(temporaryRoot(), 'control.db')
+  const alias = '6281234567890@s.whatsapp.net'
+  const audit = (id, reasonCode) => ({ schemaVersion: 1, operationId: crypto.randomUUID(),
+    executionId: id, principalId: 'owner', sessionId: 'whatsapp:owner', originChannel: 'whatsapp',
+    eventType: 'membership_changed', reasonCode, outcome: 'completed', createdAt: Date.now() })
+  let store = new AccessStore(file)
+  try {
+    assert.throws(() => store.addWhatsAppMember('wa-bad', alias, audit('wa-bad', 'invalid reason')),
+      /AUDIT_FIELD_INVALID/)
+    assert.deepEqual(store.listWhatsAppMembers(), [])
+    store.addWhatsAppMember('wa-first', alias, audit('wa-first', 'MEMBER_ADDED'))
+    assert.deepEqual(store.listWhatsAppMembers(), [{ id: 'wa-first', alias }])
+    assert.throws(() => store.revokeWhatsAppMember('wa-first', audit('wa-first', 'invalid reason')),
+      /AUDIT_FIELD_INVALID/)
+    assert.equal(store.listWhatsAppMembers().length, 1)
+    store.close()
+    store = new AccessStore(file)
+    assert.deepEqual(store.listWhatsAppMembers(), [{ id: 'wa-first', alias }])
+    store.revokeWhatsAppMember('wa-first', audit('wa-first', 'MEMBER_REVOKED'))
+    assert.deepEqual(store.listWhatsAppMembers(), [])
+    store.addWhatsAppMember('wa-second', alias, audit('wa-second', 'MEMBER_ADDED'))
+    assert.deepEqual(store.listWhatsAppMembers(), [{ id: 'wa-second', alias }])
+    store.revokeWhatsAppMemberWithoutAudit('wa-second')
+    assert.deepEqual(store.listWhatsAppMembers(), [])
+  } finally { store.close() }
 })
 
 describe('durable immutable session ownership', () => {
